@@ -139,7 +139,7 @@ func (s *NodeService) FetchCertFingerprint(ctx context.Context, n *model.Node) (
 	client := &http.Client{
 		Transport: &http.Transport{
 			DialContext:     netsafe.SSRFGuardedDialContext,
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, // lgtm[go/disabled-certificate-check]
 		},
 	}
 	resp, err := client.Do(req)
