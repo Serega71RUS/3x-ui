@@ -8,21 +8,25 @@ import {
   Input,
   InputNumber,
   Modal,
+  Popconfirm,
   Row,
   Select,
   Space,
   Switch,
+  Tabs,
   Tag,
+  Tooltip,
+  Typography,
   message,
 } from 'antd';
-import { EyeOutlined, ReloadOutlined } from '@ant-design/icons';
+import { DeleteOutlined, EyeOutlined, PlusOutlined, ReloadOutlined, RetweetOutlined } from '@ant-design/icons';
 import dayjs from 'dayjs';
 import type { Dayjs } from 'dayjs';
-
 import { HttpUtil, RandomUtil } from '@/utils';
-import { DateTimePicker } from '@/components/form';
+import { formatInboundLabel } from '@/lib/inbounds/label';
+import { DateTimePicker, SelectAllClearButtons } from '@/components/form';
 import { TLS_FLOW_CONTROL } from '@/schemas/primitives';
-import type { ClientRecord, InboundOption } from '@/hooks/useClients';
+import type { ClientRecord, InboundOption, ExternalLink, ExternalLinkInput } from '@/hooks/useClients';
 import { ClientFormSchema, ClientCreateFormSchema } from '@/schemas/client';
 
 const FLOW_OPTIONS = Object.values(TLS_FLOW_CONTROL);
@@ -32,8 +36,19 @@ const MULTI_CLIENT_PROTOCOLS = new Set([
   'shadowsocks', 'vless', 'vmess', 'trojan', 'hysteria',
 ]);
 
+const CLIENT_FORM_MODAL_Z_INDEX = 1000;
+const CLIENT_IP_LOG_MODAL_Z_INDEX = CLIENT_FORM_MODAL_Z_INDEX + 1;
+
+// One editable row in the Links tab. `key` is a stable client-side id for React.
+interface ExternalLinkRow {
+  key: number;
+  kind: 'link' | 'subscription';
+  value: string;
+}
+
 interface ApiMsg<T = unknown> {
   success?: boolean;
+  msg?: string;
   obj?: T;
 }
 
@@ -44,10 +59,13 @@ interface SaveMetaEdit {
   email: string;
   attach: number[];
   detach: number[];
+  externalLinks: ExternalLinkInput[];
 }
 
 interface SaveMetaCreate {
   isEdit: false;
+  email: string;
+  externalLinks: ExternalLinkInput[];
 }
 
 interface SaveCreatePayload {
@@ -60,14 +78,15 @@ interface ClientFormModalProps {
   mode: Mode;
   client: ClientRecord | null;
   inbounds: InboundOption[];
+  attachedExternalLinks?: ExternalLink[];
   attachedIds?: number[];
-  ipLimitEnable?: boolean;
   tgBotEnable?: boolean;
   groups?: string[];
   save: (
     payload: Record<string, unknown> | SaveCreatePayload,
     meta: SaveMetaEdit | SaveMetaCreate,
   ) => Promise<ApiMsg | null>;
+  resetTraffic?: (client: ClientRecord) => Promise<ApiMsg | null>;
   onOpenChange: (open: boolean) => void;
 }
 
@@ -91,6 +110,7 @@ interface FormState {
   comment: string;
   enable: boolean;
   inboundIds: number[];
+  externalLinks: ExternalLinkRow[];
 }
 
 function emptyForm(): FormState {
@@ -114,7 +134,17 @@ function emptyForm(): FormState {
     comment: '',
     enable: true,
     inboundIds: [],
+    externalLinks: [],
   };
+}
+
+let externalLinkRowSeq = 0;
+function toExternalLinkRows(links: ExternalLink[] | undefined): ExternalLinkRow[] {
+  return (links || []).map((l) => ({
+    key: (externalLinkRowSeq += 1),
+    kind: l.kind === 'subscription' ? 'subscription' : 'link',
+    value: l.value || '',
+  }));
 }
 
 function bytesToGB(bytes: number): number {
@@ -132,11 +162,12 @@ export default function ClientFormModal({
   mode,
   client,
   inbounds,
+  attachedExternalLinks = [],
   attachedIds = [],
-  ipLimitEnable = false,
   tgBotEnable = false,
   groups = [],
   save,
+  resetTraffic,
   onOpenChange,
 }: ClientFormModalProps) {
   const { t } = useTranslation();
@@ -145,6 +176,7 @@ export default function ClientFormModal({
 
   const [form, setForm] = useState<FormState>(emptyForm);
   const [submitting, setSubmitting] = useState(false);
+  const [resetting, setResetting] = useState(false);
   const [clientIps, setClientIps] = useState<string[]>([]);
   const [ipsLoading, setIpsLoading] = useState(false);
   const [ipsClearing, setIpsClearing] = useState(false);
@@ -152,6 +184,27 @@ export default function ClientFormModal({
 
   function update<K extends keyof FormState>(key: K, value: FormState[K]) {
     setForm((prev) => ({ ...prev, [key]: value }));
+  }
+
+  function addExternalLinkRow(kind: 'link' | 'subscription') {
+    setForm((prev) => ({
+      ...prev,
+      externalLinks: [...prev.externalLinks, { key: (externalLinkRowSeq += 1), kind, value: '' }],
+    }));
+  }
+
+  function updateExternalLinkRow(key: number, value: string) {
+    setForm((prev) => ({
+      ...prev,
+      externalLinks: prev.externalLinks.map((r) => (r.key === key ? { ...r, value } : r)),
+    }));
+  }
+
+  function removeExternalLinkRow(key: number) {
+    setForm((prev) => ({
+      ...prev,
+      externalLinks: prev.externalLinks.filter((r) => r.key !== key),
+    }));
   }
 
   useEffect(() => {
@@ -178,6 +231,7 @@ export default function ClientFormModal({
         comment: client.comment || '',
         enable: !!client.enable,
         inboundIds: Array.isArray(attachedIds) ? [...attachedIds] : [],
+        externalLinks: toExternalLinkRows(attachedExternalLinks),
       };
       if (et < 0) {
         next.delayedStart = true;
@@ -285,12 +339,15 @@ export default function ClientFormModal({
     () => (inbounds || [])
       .filter((ib) => MULTI_CLIENT_PROTOCOLS.has(ib.protocol || ''))
       .map((ib) => ({
-        label: ib.remark?.trim() || ib.tag || '',
+        label: formatInboundLabel(ib.tag, ib.remark),
         value: ib.id,
-        title: ib.remark?.trim() || ib.tag || '',
+        title: formatInboundLabel(ib.tag, ib.remark),
       })),
     [inbounds],
   );
+
+  const linkRows = useMemo(() => form.externalLinks.filter((r) => r.kind === 'link'), [form.externalLinks]);
+  const subscriptionRows = useMemo(() => form.externalLinks.filter((r) => r.kind === 'subscription'), [form.externalLinks]);
 
   async function loadIps() {
     if (!isEdit || !client?.email) return;
@@ -323,6 +380,21 @@ export default function ClientFormModal({
 
   function close() {
     onOpenChange(false);
+  }
+
+  async function onResetTraffic() {
+    if (!isEdit || !client?.email || !resetTraffic) return;
+    setResetting(true);
+    try {
+      const msg = await resetTraffic(client);
+      if (msg?.success) {
+        messageApi.success(t('pages.clients.toasts.trafficReset'));
+      } else {
+        messageApi.error(msg?.msg || t('somethingWentWrong'));
+      }
+    } finally {
+      setResetting(false);
+    }
   }
 
   async function onSubmit() {
@@ -377,6 +449,10 @@ export default function ClientFormModal({
       clientPayload.reverse = { tag: reverseTag };
     }
 
+    const externalLinks: ExternalLinkInput[] = form.externalLinks
+      .map((r) => ({ kind: r.kind, value: r.value.trim(), remark: '' }))
+      .filter((r) => r.value !== '');
+
     setSubmitting(true);
     try {
       let msg;
@@ -390,11 +466,12 @@ export default function ClientFormModal({
           email: client.email,
           attach: toAttach,
           detach: toDetach,
+          externalLinks,
         });
       } else {
         msg = await save(
           { client: clientPayload, inboundIds: form.inboundIds },
-          { isEdit: false },
+          { isEdit: false, email: clientPayload.email as string, externalLinks },
         );
       }
       if (msg?.success) close();
@@ -410,219 +487,318 @@ export default function ClientFormModal({
         open={open}
         title={isEdit ? t('pages.clients.editClient') : t('pages.clients.addClient')}
         destroyOnHidden
-        okText={isEdit ? t('save') : t('create')}
-        cancelText={t('cancel')}
-        okButtonProps={{ loading: submitting }}
         width={720}
+        zIndex={CLIENT_FORM_MODAL_Z_INDEX}
         style={{ top: 20 }}
         styles={{ body: { maxHeight: 'calc(100vh - 160px)', overflowY: 'auto', overflowX: 'hidden' } }}
-        onOk={onSubmit}
         onCancel={close}
+        footer={
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            {isEdit && resetTraffic && (
+              <Popconfirm
+                title={t('pages.inbounds.resetTraffic')}
+                description={t('pages.inbounds.resetTrafficContent')}
+                okText={t('reset')}
+                cancelText={t('cancel')}
+                zIndex={CLIENT_IP_LOG_MODAL_Z_INDEX}
+                onConfirm={onResetTraffic}
+              >
+                <Button color="danger" variant="filled" icon={<RetweetOutlined />} loading={resetting}>
+                  {t('pages.inbounds.resetTraffic')}
+                </Button>
+              </Popconfirm>
+            )}
+            <div style={{ marginInlineStart: 'auto', display: 'flex', gap: 8 }}>
+              <Button onClick={close}>{t('cancel')}</Button>
+              <Button type="primary" loading={submitting} onClick={onSubmit}>
+                {isEdit ? t('save') : t('create')}
+              </Button>
+            </div>
+          </div>
+        }
       >
         <Form layout="vertical">
-          <Row gutter={16}>
-            <Col xs={24} md={12}>
-              <Form.Item label={t('pages.clients.email')} required>
-                <Space.Compact style={{ display: 'flex' }}>
-                  <Input
-                    value={form.email}
-                    placeholder={t('pages.clients.email')}
-                    style={{ flex: 1 }}
-                    onChange={(e) => update('email', e.target.value)}
-                  />
-                  <Button icon={<ReloadOutlined />} onClick={() => update('email', RandomUtil.randomLowerAndNum(12))} />
-                </Space.Compact>
-              </Form.Item>
-            </Col>
-            <Col xs={24} md={12}>
-              <Form.Item label={t('pages.clients.subId')}>
-                <Space.Compact style={{ display: 'flex' }}>
-                  <Input value={form.subId} style={{ flex: 1 }} onChange={(e) => update('subId', e.target.value)} />
-                  <Button icon={<ReloadOutlined />} onClick={() => update('subId', RandomUtil.randomLowerAndNum(16))} />
-                </Space.Compact>
-              </Form.Item>
-            </Col>
-          </Row>
+          <Tabs
+            defaultActiveKey="basic"
+            items={[
+              {
+                key: 'basic',
+                label: t('pages.clients.tabBasics'),
+                children: (
+                  <>
+                    <Row gutter={16}>
+                      <Col xs={24} md={12}>
+                        <Form.Item label={t('pages.clients.email')} required>
+                          <Space.Compact style={{ display: 'flex' }}>
+                            <Input
+                              value={form.email}
+                              placeholder={t('pages.clients.email')}
+                              style={{ flex: 1 }}
+                              onChange={(e) => update('email', e.target.value)}
+                            />
+                            {!isEdit && (
+                              <Button icon={<ReloadOutlined />} onClick={() => update('email', RandomUtil.randomLowerAndNum(12))} />
+                            )}
+                          </Space.Compact>
+                        </Form.Item>
+                      </Col>
+                      <Col xs={24} md={6}>
+                        <Form.Item label={t('pages.clients.totalGB')} tooltip={t('pages.clients.totalGBDesc')}>
+                          <InputNumber value={form.totalGB} min={0} step={1} style={{ width: '100%' }}
+                            onChange={(v) => update('totalGB', Number(v) || 0)} />
+                        </Form.Item>
+                      </Col>
+                      <Col xs={24} md={6}>
+                        <Form.Item label={t('pages.clients.limitIp')} tooltip={t('pages.clients.limitIpDesc')}>
+                          <Space.Compact style={{ display: 'flex' }}>
+                            <InputNumber value={form.limitIp} min={0} style={{ flex: 1 }}
+                              onChange={(v) => update('limitIp', Number(v) || 0)} />
+                            {isEdit && (
+                              <Tooltip title={t('pages.clients.ipLog')}>
+                                <Button icon={<EyeOutlined />} loading={ipsLoading} onClick={openIpsModal}>
+                                  {clientIps.length > 0 ? clientIps.length : ''}
+                                </Button>
+                              </Tooltip>
+                            )}
+                          </Space.Compact>
+                        </Form.Item>
+                      </Col>
+                    </Row>
 
-          <Row gutter={16}>
-            <Col xs={24} md={12}>
-              <Form.Item label={t('pages.clients.hysteriaAuth')}>
-                <Space.Compact style={{ display: 'flex' }}>
-                  <Input value={form.auth} style={{ flex: 1 }} onChange={(e) => update('auth', e.target.value)} />
-                  <Button icon={<ReloadOutlined />} onClick={() => update('auth', RandomUtil.randomLowerAndNum(16))} />
-                </Space.Compact>
-              </Form.Item>
-            </Col>
-            <Col xs={24} md={12}>
-              <Form.Item label={t('pages.clients.password')}>
-                <Space.Compact style={{ display: 'flex' }}>
-                  <Input value={form.password} style={{ flex: 1 }} onChange={(e) => update('password', e.target.value)} />
-                  <Button icon={<ReloadOutlined />} onClick={regeneratePassword} />
-                </Space.Compact>
-              </Form.Item>
-            </Col>
-          </Row>
+                    <Row gutter={16}>
+                      <Col xs={24} md={12}>
+                        {form.delayedStart ? (
+                          <Form.Item label={t('pages.clients.expireDays')}>
+                            <InputNumber value={form.delayedDays} min={0} style={{ width: '100%' }}
+                              onChange={(v) => update('delayedDays', Number(v) || 0)} />
+                          </Form.Item>
+                        ) : (
+                          <Form.Item label={t('pages.clients.expiryTime')}>
+                            <DateTimePicker
+                              value={form.expiryDate}
+                              onChange={(d) => update('expiryDate', d || null)}
+                            />
+                          </Form.Item>
+                        )}
+                      </Col>
+                      <Col xs={12} md={6}>
+                        <Form.Item label={t('pages.clients.delayedStart')}>
+                          <Switch
+                            checked={form.delayedStart}
+                            onChange={(v) => {
+                              update('delayedStart', v);
+                              if (v) update('expiryDate', null);
+                              else update('delayedDays', 0);
+                            }}
+                          />
+                        </Form.Item>
+                      </Col>
+                      <Col xs={12} md={6}>
+                        <Form.Item
+                          label={t('pages.clients.renewDays')}
+                          tooltip={t('pages.clients.renewDesc')}
+                        >
+                          <InputNumber value={form.reset} min={0} style={{ width: '100%' }}
+                            onChange={(v) => update('reset', Number(v) || 0)} />
+                        </Form.Item>
+                      </Col>
+                    </Row>
 
-          <Row gutter={16}>
-            <Col xs={24} md={12}>
-              <Form.Item label={t('pages.clients.uuid')}>
-                <Space.Compact style={{ display: 'flex' }}>
-                  <Input value={form.uuid} style={{ flex: 1 }} onChange={(e) => update('uuid', e.target.value)} />
-                  <Button icon={<ReloadOutlined />} onClick={() => update('uuid', RandomUtil.randomUUID())} />
-                </Space.Compact>
-              </Form.Item>
-            </Col>
-            <Col xs={24} md={ipLimitEnable ? 8 : 12}>
-              <Form.Item label={t('pages.clients.totalGB')}>
-                <InputNumber value={form.totalGB} min={0} step={1} style={{ width: '100%' }}
-                  onChange={(v) => update('totalGB', Number(v) || 0)} />
-              </Form.Item>
-            </Col>
-            {ipLimitEnable && (
-              <Col xs={24} md={4}>
-                <Form.Item label={t('pages.clients.limitIp')}>
-                  <InputNumber value={form.limitIp} min={0} style={{ width: '100%' }}
-                    onChange={(v) => update('limitIp', Number(v) || 0)} />
-                </Form.Item>
-              </Col>
-            )}
-          </Row>
+                    <Row gutter={16}>
+                      <Col xs={24} md={12}>
+                        <Form.Item label={t('pages.clients.comment')}>
+                          <Input value={form.comment} onChange={(e) => update('comment', e.target.value)} />
+                        </Form.Item>
+                      </Col>
+                      <Col xs={24} md={12}>
+                        <Form.Item label={t('pages.clients.group')} tooltip={t('pages.clients.groupDesc')}>
+                          <AutoComplete
+                            value={form.group}
+                            placeholder={t('pages.clients.groupPlaceholder')}
+                            options={groups.map((g) => ({ value: g }))}
+                            onChange={(v) => update('group', v ?? '')}
+                            allowClear
+                          />
+                        </Form.Item>
+                      </Col>
+                    </Row>
 
-          <Row gutter={16}>
-            <Col xs={24} md={12}>
-              {form.delayedStart ? (
-                <Form.Item label={t('pages.clients.expireDays')}>
-                  <InputNumber value={form.delayedDays} min={0} style={{ width: '100%' }}
-                    onChange={(v) => update('delayedDays', Number(v) || 0)} />
-                </Form.Item>
-              ) : (
-                <Form.Item label={t('pages.clients.expiryTime')}>
-                  <DateTimePicker
-                    value={form.expiryDate}
-                    onChange={(d) => update('expiryDate', d || null)}
-                  />
-                </Form.Item>
-              )}
-            </Col>
-            <Col xs={24} md={12}>
-              <Form.Item label={t('pages.clients.delayedStart')}>
-                <Switch
-                  checked={form.delayedStart}
-                  onChange={(v) => {
-                    update('delayedStart', v);
-                    if (v) update('expiryDate', null);
-                    else update('delayedDays', 0);
-                  }}
-                />
-              </Form.Item>
-            </Col>
-          </Row>
+                    {(tgBotEnable || showReverseTag) && (
+                      <Row gutter={16}>
+                        {tgBotEnable && (
+                          <Col xs={24} md={12}>
+                            <Form.Item label={t('pages.clients.telegramId')}>
+                              <InputNumber value={form.tgId} min={0} controls={false}
+                                placeholder={t('pages.clients.telegramIdPlaceholder')} style={{ width: '100%' }}
+                                onChange={(v) => update('tgId', Number(v) || 0)} />
+                            </Form.Item>
+                          </Col>
+                        )}
+                        {showReverseTag && (
+                          <Col xs={24} md={12}>
+                            <Form.Item label={t('pages.clients.reverseTag')}>
+                              <Input value={form.reverseTag} placeholder={t('pages.clients.reverseTagPlaceholder')}
+                                onChange={(e) => update('reverseTag', e.target.value)} />
+                            </Form.Item>
+                          </Col>
+                        )}
+                      </Row>
+                    )}
 
-          <Row gutter={16}>
-            <Col xs={24} md={12}>
-              <Form.Item
-                label={t('pages.clients.renew')}
-                tooltip={t('pages.clients.renewDesc')}
-              >
-                <InputNumber value={form.reset} min={0} style={{ width: '100%' }}
-                  onChange={(v) => update('reset', Number(v) || 0)} />
-              </Form.Item>
-            </Col>
-            {showReverseTag && (
-              <Col xs={24} md={12}>
-                <Form.Item label={t('pages.clients.reverseTag')}>
-                  <Input value={form.reverseTag} placeholder={t('pages.clients.reverseTagPlaceholder')}
-                    onChange={(e) => update('reverseTag', e.target.value)} />
-                </Form.Item>
-              </Col>
-            )}
-            {showFlow && (
-              <Col xs={24} md={12}>
-                <Form.Item label={t('pages.clients.flow')}>
-                  <Select
-                    value={form.flow}
-                    onChange={(v) => update('flow', v)}
-                    options={[
-                      { value: '', label: t('none') },
-                      ...FLOW_OPTIONS.map((k) => ({ value: k, label: k })),
-                    ]}
-                  />
-                </Form.Item>
-              </Col>
-            )}
-            {showSecurity && (
-              <Col xs={24} md={12}>
-                <Form.Item label={t('pages.clients.vmessSecurity')}>
-                  <Select
-                    value={form.security}
-                    onChange={(v) => update('security', v)}
-                    options={VMESS_SECURITY_OPTIONS.map((k) => ({ value: k, label: k }))}
-                  />
-                </Form.Item>
-              </Col>
-            )}
-          </Row>
+                    <Form.Item label={t('pages.clients.attachedInbounds')} required={!isEdit}>
+                      <SelectAllClearButtons
+                        options={inboundOptions}
+                        value={form.inboundIds}
+                        onChange={(v) => update('inboundIds', v)}
+                      />
+                      <Select
+                        mode="multiple"
+                        value={form.inboundIds}
+                        onChange={(v) => update('inboundIds', v)}
+                        options={inboundOptions}
+                        placeholder={t('pages.clients.selectInbound')}
+                        maxTagCount="responsive"
+                        placement="topLeft"
+                        listHeight={220}
+                        showSearch={{
+                          filterOption: (input, option) => ((option?.label as string) || '').toLowerCase().includes(input.toLowerCase()),
+                        }}
+                      />
+                    </Form.Item>
 
-          <Row gutter={16}>
-            {tgBotEnable && (
-              <Col xs={24} md={12}>
-                <Form.Item label={t('pages.clients.telegramId')}>
-                  <InputNumber value={form.tgId} min={0} controls={false}
-                    placeholder={t('pages.clients.telegramIdPlaceholder')} style={{ width: '100%' }}
-                    onChange={(v) => update('tgId', Number(v) || 0)} />
-                </Form.Item>
-              </Col>
-            )}
-            <Col xs={24} md={tgBotEnable ? 12 : 24}>
-              <Form.Item label={t('pages.clients.comment')}>
-                <Input value={form.comment} onChange={(e) => update('comment', e.target.value)} />
-              </Form.Item>
-            </Col>
-            <Col xs={24} md={12}>
-              <Form.Item label={t('pages.clients.group')} tooltip={t('pages.clients.groupDesc')}>
-                <AutoComplete
-                  value={form.group}
-                  placeholder={t('pages.clients.groupPlaceholder')}
-                  options={groups.map((g) => ({ value: g }))}
-                  onChange={(v) => update('group', v ?? '')}
-                  filterOption={(input, option) =>
-                    String(option?.value ?? '').toLowerCase().includes((input || '').toLowerCase())
-                  }
-                  allowClear
-                  style={{ width: '100%' }}
-                />
-              </Form.Item>
-            </Col>
-          </Row>
+                    <Form.Item>
+                      <Switch checked={form.enable} onChange={(v) => update('enable', v)} />
+                      <span style={{ marginLeft: 8 }}>{t('enable')}</span>
+                    </Form.Item>
+                  </>
+                ),
+              },
+              {
+                key: 'config',
+                label: t('pages.clients.tabCredentials'),
+                children: (
+                  <>
+                    <Row gutter={16}>
+                      <Col xs={24} md={12}>
+                        <Form.Item label={t('pages.clients.uuid')}>
+                          <Space.Compact style={{ display: 'flex' }}>
+                            <Input value={form.uuid} style={{ flex: 1 }} onChange={(e) => update('uuid', e.target.value)} />
+                            <Button icon={<ReloadOutlined />} onClick={() => update('uuid', RandomUtil.randomUUID())} />
+                          </Space.Compact>
+                        </Form.Item>
+                      </Col>
+                      <Col xs={24} md={12}>
+                        <Form.Item label={t('pages.clients.password')}>
+                          <Space.Compact style={{ display: 'flex' }}>
+                            <Input value={form.password} style={{ flex: 1 }} onChange={(e) => update('password', e.target.value)} />
+                            <Button icon={<ReloadOutlined />} onClick={regeneratePassword} />
+                          </Space.Compact>
+                        </Form.Item>
+                      </Col>
+                    </Row>
 
-          <Form.Item label={t('pages.clients.attachedInbounds')} required={!isEdit}>
-            <Select
-              mode="multiple"
-              value={form.inboundIds}
-              onChange={(v) => update('inboundIds', v)}
-              options={inboundOptions}
-              placeholder={t('pages.clients.selectInbound')}
-              maxTagCount="responsive"
-              placement="topLeft"
-              listHeight={220}
-              showSearch={{
-                filterOption: (input, option) => ((option?.label as string) || '').toLowerCase().includes(input.toLowerCase()),
-              }}
-            />
-          </Form.Item>
+                    <Row gutter={16}>
+                      <Col xs={24} md={12}>
+                        <Form.Item label={t('pages.clients.subId')}>
+                          <Space.Compact style={{ display: 'flex' }}>
+                            <Input value={form.subId} style={{ flex: 1 }} onChange={(e) => update('subId', e.target.value)} />
+                            <Button icon={<ReloadOutlined />} onClick={() => update('subId', RandomUtil.randomLowerAndNum(16))} />
+                          </Space.Compact>
+                        </Form.Item>
+                      </Col>
+                      <Col xs={24} md={12}>
+                        <Form.Item label={t('pages.clients.hysteriaAuth')}>
+                          <Space.Compact style={{ display: 'flex' }}>
+                            <Input value={form.auth} style={{ flex: 1 }} onChange={(e) => update('auth', e.target.value)} />
+                            <Button icon={<ReloadOutlined />} onClick={() => update('auth', RandomUtil.randomLowerAndNum(16))} />
+                          </Space.Compact>
+                        </Form.Item>
+                      </Col>
+                    </Row>
 
-          <Form.Item>
-            <Switch checked={form.enable} onChange={(v) => update('enable', v)} />
-            <span style={{ marginLeft: 8 }}>{t('enable')}</span>
-          </Form.Item>
+                    <Row gutter={16}>
+                      {showFlow && (
+                        <Col xs={24} md={12}>
+                          <Form.Item label={t('pages.clients.flow')}>
+                            <Select
+                              value={form.flow}
+                              onChange={(v) => update('flow', v)}
+                              options={[
+                                { value: '', label: t('none') },
+                                ...FLOW_OPTIONS.map((k) => ({ value: k, label: k })),
+                              ]}
+                            />
+                          </Form.Item>
+                        </Col>
+                      )}
+                      {showSecurity && (
+                        <Col xs={24} md={12}>
+                          <Form.Item label={t('pages.clients.vmessSecurity')}>
+                            <Select
+                              value={form.security}
+                              onChange={(v) => update('security', v)}
+                              options={VMESS_SECURITY_OPTIONS.map((k) => ({ value: k, label: k }))}
+                            />
+                          </Form.Item>
+                        </Col>
+                      )}
+                    </Row>
+                  </>
+                ),
+              },
+              {
+                key: 'links',
+                label: t('pages.clients.tabLinks'),
+                children: (
+                  <>
+                    <Typography.Paragraph type="secondary" style={{ marginTop: 4 }}>
+                      {t('pages.clients.linksHint')}
+                    </Typography.Paragraph>
 
-          {isEdit && ipLimitEnable && (
-            <Form.Item label={t('pages.clients.ipLog')}>
-              <Button icon={<EyeOutlined />} loading={ipsLoading} onClick={openIpsModal}>
-                {clientIps.length > 0 ? clientIps.length : ''}
-              </Button>
-            </Form.Item>
-          )}
+                    <Button type="primary" icon={<PlusOutlined />} onClick={() => addExternalLinkRow('link')}>
+                      {t('pages.clients.addExternalLink')}
+                    </Button>
+                    <div style={{ marginTop: 12, marginBottom: 24 }}>
+                      {linkRows.length === 0 ? (
+                        <Typography.Text type="secondary">{t('pages.clients.noExternalLinks')}</Typography.Text>
+                      ) : linkRows.map((row) => (
+                        <div key={row.key} style={{ display: 'flex', gap: 8, marginBottom: 8 }}>
+                          <Input
+                            value={row.value}
+                            onChange={(e) => updateExternalLinkRow(row.key, e.target.value)}
+                            placeholder="vless:// · vmess:// · trojan:// · ss:// · hysteria2:// · wireguard://"
+                          />
+                          <Tooltip title={t('delete')}>
+                            <Button danger icon={<DeleteOutlined />} onClick={() => removeExternalLinkRow(row.key)} />
+                          </Tooltip>
+                        </div>
+                      ))}
+                    </div>
+
+                    <Button type="primary" icon={<PlusOutlined />} onClick={() => addExternalLinkRow('subscription')}>
+                      {t('pages.clients.addExternalSubscription')}
+                    </Button>
+                    <div style={{ marginTop: 12 }}>
+                      {subscriptionRows.length === 0 ? (
+                        <Typography.Text type="secondary">{t('pages.clients.noExternalSubscriptions')}</Typography.Text>
+                      ) : subscriptionRows.map((row) => (
+                        <div key={row.key} style={{ display: 'flex', gap: 8, marginBottom: 8 }}>
+                          <Input
+                            value={row.value}
+                            onChange={(e) => updateExternalLinkRow(row.key, e.target.value)}
+                            placeholder="https://provider.example/sub/…"
+                          />
+                          <Tooltip title={t('delete')}>
+                            <Button danger icon={<DeleteOutlined />} onClick={() => removeExternalLinkRow(row.key)} />
+                          </Tooltip>
+                        </div>
+                      ))}
+                    </div>
+                  </>
+                ),
+              },
+            ]}
+          />
         </Form>
       </Modal>
 
@@ -630,6 +806,7 @@ export default function ClientFormModal({
         open={ipsModalOpen}
         title={`${t('pages.clients.ipLog')}${client?.email ? ` — ${client.email}` : ''}`}
         width={440}
+        zIndex={CLIENT_IP_LOG_MODAL_Z_INDEX}
         onCancel={() => setIpsModalOpen(false)}
         footer={[
           <Button key="refresh" icon={<ReloadOutlined />} loading={ipsLoading} onClick={loadIps}>

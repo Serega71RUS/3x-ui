@@ -33,7 +33,7 @@ Built as an enhanced fork of the original X-UI project, 3X-UI adds broader proto
 - **Traffic statistics** — per inbound, per client, and per outbound, with reset controls.
 - **Multi-node support** — manage and scale across multiple servers from a single panel.
 - **Outbound & routing** — WARP, NordVPN, custom routing rules, load balancers, and outbound proxy chaining.
-- **Built-in subscription server** with multiple output formats.
+- **Built-in subscription server** with multiple output formats and [custom page templates](docs/custom-subscription-templates.md).
 - **Telegram bot** for remote monitoring and management.
 - **RESTful API** with in-panel Swagger documentation.
 - **Flexible storage** — SQLite (default) or PostgreSQL.
@@ -76,6 +76,18 @@ bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.
 During installation a random username, password, and access path are generated. After installation, run `x-ui` to open the management menu, where you can start/stop the service, view or reset your login credentials, manage SSL certificates, and more.
 
 For full documentation, please visit the [project Wiki](https://github.com/MHSanaei/3x-ui/wiki).
+
+### Unattended install & cloud images
+
+The installer also runs **non-interactively** for cloud-init and golden images.
+Set `XUI_NONINTERACTIVE=1` (or pipe with no TTY) and it installs end-to-end with
+zero prompts, generating random credentials and writing them to
+`/etc/x-ui/install-result.env`. See [`deploy/`](deploy/) for:
+
+- [Cloud-init user-data](deploy/cloud-init/) — unattended install on any cloud (Hetzner/AWS/DO/Vultr/GCP/Azure/Oracle)
+- [Packer golden image](deploy/packer/) — build an AWS EC2 AMI + qcow2 (amd64/arm64) with per-instance credentials generated on first boot
+- [Amazon Lightsail](deploy/lightsail/) — launch script + reusable snapshot builder
+- [AWS Marketplace checklist](deploy/marketplace/aws/)
 
 ## Supported Platforms
 
@@ -130,6 +142,7 @@ docker run -d --cap-add=NET_ADMIN --cap-add=NET_RAW ... ghcr.io/mhsanaei/3x-ui
 | `XUI_DB_FOLDER` | Directory for the SQLite database file | `/etc/x-ui` |
 | `XUI_DB_MAX_OPEN_CONNS` | Maximum open connections (PostgreSQL pool) | — |
 | `XUI_DB_MAX_IDLE_CONNS` | Maximum idle connections (PostgreSQL pool) | — |
+| `XUI_INIT_WEB_BASE_PATH` | The initial URI path for the web panel | `/` |
 | `XUI_ENABLE_FAIL2BAN` | Enable Fail2ban-based IP-limit enforcement | `true` |
 | `XUI_LOG_LEVEL` | Log verbosity (`debug`, `info`, `warning`, `error`) | `info` |
 | `XUI_DEBUG` | Enable debug mode | `false` |
