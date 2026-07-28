@@ -11,8 +11,10 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/mhsanaei/3x-ui/v3/internal/database"
@@ -23,6 +25,8 @@ import (
 	"github.com/mhsanaei/3x-ui/v3/internal/util/netsafe"
 	"github.com/mhsanaei/3x-ui/v3/internal/web/runtime"
 	"github.com/mhsanaei/3x-ui/v3/internal/xray"
+
+	"gorm.io/gorm"
 )
 
 type HeartbeatPatch struct {
@@ -35,7 +39,11 @@ type HeartbeatPatch struct {
 	CpuPct        float64
 	MemPct        float64
 	UptimeSecs    uint64
-	LastError     string
+	// NetUp/NetDown are the node's current interface throughput (bytes/sec),
+	// summed over non-virtual interfaces, read from its status response.
+	NetUp     uint64
+	NetDown   uint64
+	LastError string
 	// XrayState and XrayError come from the remote /panel/api/server/status when the
 	// panel API is reachable. They allow distinguishing panel connectivity from
 	// Xray core health on the node.
@@ -115,10 +123,8 @@ func (s *NodeService) GetAll() ([]*model.Node, error) {
 		return nodes, nil
 	}
 	inboundsByNode := make(map[int][]int, len(nodes))
-	nodeByInbound := make(map[int]int, len(inboundRows))
 	for _, row := range inboundRows {
 		inboundsByNode[row.NodeID] = append(inboundsByNode[row.NodeID], row.Id)
-		nodeByInbound[row.Id] = row.NodeID
 	}
 
 	type clientCountRow struct {
@@ -143,58 +149,103 @@ func (s *NodeService) GetAll() ([]*model.Node, error) {
 		}
 	}
 
-	now := time.Now().UnixMilli()
-	type trafficRow struct {
-		InboundID  int `gorm:"column:inbound_id"`
-		Email      string
-		Enable     bool
-		Total      int64
-		Up         int64
-		Down       int64
-		ExpiryTime int64 `gorm:"column:expiry_time"`
-	}
-	var trafficRows []trafficRow
-	inboundIDs := make([]int, 0, len(nodeByInbound))
-	for id := range nodeByInbound {
-		inboundIDs = append(inboundIDs, id)
-	}
-	// Chunk the IN clause to avoid "too many SQL variables" on SQLite
-	// when there are many node-owned inbounds (common with many nodes).
-	// sqliteMaxVars is defined in this package (inbound.go).
-	for _, batch := range chunkInts(inboundIDs, sqliteMaxVars) {
-		var page []trafficRow
-		if err := db.Table("client_traffics").
-			Select("inbound_id, email, enable, total, up, down, expiry_time").
-			Where("inbound_id IN ?", batch).
-			Scan(&page).Error; err == nil {
-			trafficRows = append(trafficRows, page...)
-		}
-	}
 	depletedByNode := make(map[int]int)
-	if len(trafficRows) > 0 {
-		for _, row := range trafficRows {
-			nodeID, ok := nodeByInbound[row.InboundID]
-			if !ok {
-				continue
-			}
-			expired := row.ExpiryTime > 0 && row.ExpiryTime <= now
-			exhausted := row.Total > 0 && row.Up+row.Down >= row.Total
-			if expired || exhausted || !row.Enable {
-				depletedByNode[nodeID]++
-			}
+	disabledByNode := make(map[int]int)
+	activeByNode := make(map[int]int)
+	statuses, _ := s.nodeClientStatuses()
+	seen := make(map[int]map[int]struct{}, len(nodes))
+	for _, st := range statuses {
+		clientsSeen := seen[st.NodeID]
+		if clientsSeen == nil {
+			clientsSeen = make(map[int]struct{})
+			seen[st.NodeID] = clientsSeen
+		}
+		if _, dup := clientsSeen[st.ClientID]; dup {
+			// A client attached to several inbounds of one node counts once,
+			// matching the distinct ClientCount above.
+			continue
+		}
+		clientsSeen[st.ClientID] = struct{}{}
+		switch {
+		case st.Depleted:
+			depletedByNode[st.NodeID]++
+		case st.Disabled:
+			disabledByNode[st.NodeID]++
+		default:
+			activeByNode[st.NodeID]++
 		}
 	}
 	onlineByGuid := s.onlineEmailsByGuid()
+	selfGuid, _ := (&SettingService{}).GetPanelGuid()
+	ambiguous := ambiguousNodeGuids(nodes, selfGuid)
 	for _, n := range nodes {
 		n.InboundCount = len(inboundsByNode[n.Id])
 		n.DepletedCount = depletedByNode[n.Id]
+		n.DisabledCount = disabledByNode[n.Id]
+		n.ActiveCount = activeByNode[n.Id]
 		// Online is attributed to the node that physically hosts the client
 		// (by GUID): a client on a sub-node counts under the sub-node, not
 		// the intermediate node it syncs through (#4983).
-		n.OnlineCount = len(onlineByGuid[effectiveNodeGuid(n)])
+		n.OnlineCount = len(onlineByGuid[effectiveNodeGuid(n, ambiguous)])
 	}
 
 	return nodes, nil
+}
+
+// nodeClientStatus is one node-hosted client's classification, carrying enough
+// identity for callers to bucket it by node id or by attribution GUID.
+type nodeClientStatus struct {
+	InboundID int
+	NodeID    int
+	ClientID  int
+	Depleted  bool
+	Disabled  bool
+}
+
+// nodeClientStatuses classifies every client attached to a node-hosted inbound as
+// depleted / disabled / active, matching client_traffics by EMAIL rather than by
+// inbound_id. client_traffics.inbound_id goes stale after an inbound is
+// delete+recreated, so filtering by it silently drops most rows; the
+// client_inbounds -> clients join is the reliable client set and the email join
+// pulls each client's live counters. Precedence matches the inbound page:
+// depleted (expired/exhausted) wins over disabled.
+func (s *NodeService) nodeClientStatuses() ([]nodeClientStatus, error) {
+	type row struct {
+		InboundID  int   `gorm:"column:inbound_id"`
+		NodeID     int   `gorm:"column:node_id"`
+		ClientID   int   `gorm:"column:client_id"`
+		Enable     bool  `gorm:"column:enable"`
+		Total      int64 `gorm:"column:total"`
+		Up         int64 `gorm:"column:up"`
+		Down       int64 `gorm:"column:down"`
+		ExpiryTime int64 `gorm:"column:expiry_time"`
+	}
+	var rows []row
+	if err := database.GetDB().Table("inbounds").
+		Select("inbounds.id AS inbound_id, inbounds.node_id AS node_id, clients.id AS client_id, " +
+			"clients.enable AS enable, ct.total AS total, ct.up AS up, ct.down AS down, ct.expiry_time AS expiry_time").
+		Joins("JOIN client_inbounds ON client_inbounds.inbound_id = inbounds.id").
+		Joins("JOIN clients ON clients.id = client_inbounds.client_id").
+		Joins("LEFT JOIN client_traffics ct ON ct.email = clients.email").
+		Where("inbounds.node_id IS NOT NULL").
+		Scan(&rows).Error; err != nil {
+		return nil, err
+	}
+	now := time.Now().UnixMilli()
+	out := make([]nodeClientStatus, 0, len(rows))
+	for _, r := range rows {
+		st := nodeClientStatus{InboundID: r.InboundID, NodeID: r.NodeID, ClientID: r.ClientID}
+		expired := r.ExpiryTime > 0 && r.ExpiryTime <= now
+		exhausted := r.Total > 0 && r.Up+r.Down >= r.Total
+		switch {
+		case expired || exhausted:
+			st.Depleted = true
+		case !r.Enable:
+			st.Disabled = true
+		}
+		out = append(out, st)
+	}
+	return out, nil
 }
 
 func (s *NodeService) onlineEmailsByGuid() map[string]map[string]struct{} {
@@ -211,14 +262,69 @@ func (s *NodeService) onlineEmailsByGuid() map[string]map[string]struct{} {
 	return out
 }
 
-// effectiveNodeGuid is a node's stable online-attribution key: its reported
-// panelGuid, or a master-local synthetic id when the node is an old build that
-// hasn't reported one yet (#4983).
-func effectiveNodeGuid(n *model.Node) string {
-	if n.Guid != "" {
-		return n.Guid
+// effectiveNodeGuid is a node's stable online/inbound attribution key: its
+// reported panelGuid, or a master-local synthetic node-id fallback when the node
+// has no GUID yet (old build) or its GUID is ambiguous. ambiguous comes from
+// ambiguousNodeGuids.
+func effectiveNodeGuid(n *model.Node, ambiguous map[string]struct{}) string {
+	if n.Guid == "" {
+		return synthNodeGuid(n.Id)
 	}
-	return synthNodeGuid(n.Id)
+	if n.Id > 0 {
+		if _, bad := ambiguous[n.Guid]; bad {
+			return synthNodeGuid(n.Id)
+		}
+	}
+	return n.Guid
+}
+
+// ambiguousNodeGuids returns the panelGuids a node must not be attributed under
+// directly, because doing so would merge two distinct identities: a GUID
+// reported by more than one of this master's direct nodes (cloned node servers
+// ship the same panelGuid in their copied settings), or a GUID equal to the
+// master's own panelGuid (a node cloned from the master). A node holding such a
+// GUID falls back to its node-unique synthNodeGuid. Transitive sub-nodes (Id 0)
+// carry distinct descendant GUIDs by construction and are excluded.
+func ambiguousNodeGuids(nodes []*model.Node, selfGuid string) map[string]struct{} {
+	counts := make(map[string]int, len(nodes))
+	for _, n := range nodes {
+		if n.Id > 0 && n.Guid != "" {
+			counts[n.Guid]++
+		}
+	}
+	ambiguous := make(map[string]struct{})
+	for guid, c := range counts {
+		if c > 1 {
+			ambiguous[guid] = struct{}{}
+		}
+	}
+	if selfGuid != "" {
+		if _, ok := counts[selfGuid]; ok {
+			ambiguous[selfGuid] = struct{}{}
+		}
+	}
+	return ambiguous
+}
+
+// effectiveNodeKey returns one node's attribution key without a preloaded node
+// list — its panelGuid when that GUID uniquely identifies it among the master's
+// nodes and differs from the master's own, otherwise its node-unique
+// synthNodeGuid. Same rule as effectiveNodeGuid + ambiguousNodeGuids, for the
+// write paths that handle a single node (online tree, IP attribution).
+func effectiveNodeKey(node *model.Node) string {
+	if node == nil {
+		return ""
+	}
+	if node.Guid == "" {
+		return synthNodeGuid(node.Id)
+	}
+	var sameGuid int64
+	database.GetDB().Model(&model.Node{}).Where("guid = ?", node.Guid).Count(&sameGuid)
+	masterGuid, _ := (&SettingService{}).GetPanelGuid()
+	if sameGuid > 1 || node.Guid == masterGuid {
+		return synthNodeGuid(node.Id)
+	}
+	return node.Guid
 }
 
 func (s *NodeService) GetById(id int) (*model.Node, error) {
@@ -228,6 +334,14 @@ func (s *NodeService) GetById(id int) (*model.Node, error) {
 		return nil, err
 	}
 	return n, nil
+}
+
+func (s *NodeService) GetViewById(id int) (*NodeView, error) {
+	n, err := s.GetById(id)
+	if err != nil {
+		return nil, err
+	}
+	return toNodeView(n), nil
 }
 
 // NodeExists reports whether a node with the given id exists on this panel.
@@ -275,8 +389,11 @@ func (s *NodeService) normalize(n *model.Node) error {
 	if n.Scheme != "http" && n.Scheme != "https" {
 		n.Scheme = "https"
 	}
-	if n.TlsVerifyMode != "skip" && n.TlsVerifyMode != "pin" {
+	if n.TlsVerifyMode != "skip" && n.TlsVerifyMode != "pin" && n.TlsVerifyMode != "mtls" {
 		n.TlsVerifyMode = "verify"
+	}
+	if n.TlsVerifyMode == "mtls" && n.Scheme != "https" {
+		return common.NewError("mtls requires the node scheme to be https")
 	}
 	n.PinnedCertSha256 = strings.TrimSpace(n.PinnedCertSha256)
 	if n.InboundSyncMode != "selected" {
@@ -315,6 +432,17 @@ func (s *NodeService) Create(n *model.Node) error {
 	return db.Create(n).Error
 }
 
+func (s *NodeService) CreateFromRequest(req *NodeMutationRequest) (*NodeView, error) {
+	if err := req.validateCredentials(true); err != nil {
+		return nil, err
+	}
+	n := req.toNode()
+	if err := s.Create(n); err != nil {
+		return nil, err
+	}
+	return toNodeView(n), nil
+}
+
 func (s *NodeService) Update(id int, in *model.Node) error {
 	if err := s.normalize(in); err != nil {
 		return err
@@ -344,7 +472,12 @@ func (s *NodeService) Update(id int, in *model.Node) error {
 		"inbound_tags":          string(inboundTagsJSON),
 		"outbound_tag":          in.OutboundTag,
 	}
-	if err := db.Model(model.Node{}).Where("id = ?", id).Updates(updates).Error; err != nil {
+	if err := db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Model(model.Node{}).Where("id = ?", id).Updates(updates).Error; err != nil {
+			return err
+		}
+		return s.MarkNodeDirtyTx(tx, id)
+	}); err != nil {
 		return err
 	}
 	if mgr := runtime.GetManager(); mgr != nil {
@@ -353,12 +486,134 @@ func (s *NodeService) Update(id int, in *model.Node) error {
 	return nil
 }
 
+func (s *NodeService) UpdateFromRequest(id int, req *NodeMutationRequest) error {
+	if err := req.validateCredentials(false); err != nil {
+		return err
+	}
+	in := req.toNode()
+	if err := s.normalize(in); err != nil {
+		return err
+	}
+	inboundTagsJSON, err := json.Marshal(in.InboundTags)
+	if err != nil {
+		return err
+	}
+	db := database.GetDB()
+	existing := &model.Node{}
+	if err := db.Where("id = ?", id).First(existing).Error; err != nil {
+		return err
+	}
+	apiToken := existing.ApiToken
+	switch {
+	case req.ClearApiToken:
+		apiToken = ""
+	case req.ApiToken != nil:
+		apiToken = *req.ApiToken
+	}
+	if apiToken == "" && in.Enable && in.TlsVerifyMode != "mtls" {
+		return common.NewError("apiToken is required unless mtls is enabled")
+	}
+	updates := map[string]any{
+		"name":                  in.Name,
+		"remark":                in.Remark,
+		"scheme":                in.Scheme,
+		"address":               in.Address,
+		"port":                  in.Port,
+		"base_path":             in.BasePath,
+		"api_token":             apiToken,
+		"enable":                in.Enable,
+		"allow_private_address": in.AllowPrivateAddress,
+		"tls_verify_mode":       in.TlsVerifyMode,
+		"pinned_cert_sha256":    in.PinnedCertSha256,
+		"inbound_sync_mode":     in.InboundSyncMode,
+		"inbound_tags":          string(inboundTagsJSON),
+		"outbound_tag":          in.OutboundTag,
+	}
+	if err := db.Model(model.Node{}).Where("id = ?", id).Updates(updates).Error; err != nil {
+		return err
+	}
+	if dErr := s.MarkNodeDirty(id); dErr != nil {
+		logger.Warning("mark node dirty after update failed:", dErr)
+	}
+	if mgr := runtime.GetManager(); mgr != nil {
+		mgr.InvalidateNode(id)
+	}
+	return nil
+}
+
+func (s *NodeService) RuntimeNodeFromRequest(id int, req *NodeMutationRequest) (*model.Node, error) {
+	if err := req.validateCredentials(id == 0); err != nil {
+		return nil, err
+	}
+	var n *model.Node
+	if id > 0 {
+		existing, err := s.GetById(id)
+		if err != nil {
+			return nil, err
+		}
+		n = existing
+	} else {
+		n = &model.Node{}
+	}
+	overlay := req.toNode()
+	overlay.Id = id
+	if req.ApiToken == nil {
+		overlay.ApiToken = n.ApiToken
+	}
+	if req.ClearApiToken {
+		overlay.ApiToken = ""
+	}
+	*n = *overlay
+	if err := s.normalize(n); err != nil {
+		return nil, err
+	}
+	if n.ApiToken == "" && n.Enable && n.TlsVerifyMode != "mtls" {
+		return nil, common.NewError("apiToken is required unless mtls is enabled")
+	}
+	return n, nil
+}
+
+func (s *NodeService) NodeFromRequestForCertificate(req *NodeMutationRequest) (*model.Node, error) {
+	if req == nil {
+		return nil, common.NewError("node request is required")
+	}
+	n := req.toNode()
+	if n.Scheme == "" {
+		n.Scheme = "https"
+	}
+	if n.BasePath == "" {
+		n.BasePath = "/"
+	}
+	if err := s.normalize(n); err != nil {
+		return nil, err
+	}
+	return n, nil
+}
+
 func (s *NodeService) GetRemoteInboundOptions(ctx context.Context, n *model.Node) ([]runtime.RemoteInboundOption, error) {
 	if err := s.normalize(n); err != nil {
 		return nil, err
 	}
-	return runtime.NewRemote(n, nil).ListInboundOptions(ctx)
+	if n.OutboundTag == "" {
+		return runtime.NewRemote(n, nil).ListInboundOptions(ctx)
+	}
+	// Mirror ProbeWithOutbound: a node being added/edited has no persistent
+	// egress bridge yet, so route the list call through a temporary one or the
+	// remote panel stays unreachable and the request times out.
+	var options []runtime.RemoteInboundOption
+	var err error
+	s.withOutboundBridge(n.Id, n.OutboundTag, func(proxyURL string) {
+		options, err = runtime.NewRemote(n, staticEgressResolver(proxyURL)).ListInboundOptions(ctx)
+	})
+	return options, err
 }
+
+// staticEgressResolver hands a fixed proxy URL to runtime.NewRemote. An empty
+// string yields a direct connection, so it doubles as the graceful fallback
+// when a temporary bridge can't be built.
+type staticEgressResolver string
+
+func (r staticEgressResolver) NodeEgressProxyURL(int) string { return string(r) }
 
 // EnsureInboundTagAllowed adds a panel-managed inbound's tag to the node's
 // selection when the node syncs in "selected" mode. Without it, the next
@@ -368,28 +623,32 @@ func (s *NodeService) GetRemoteInboundOptions(ctx context.Context, n *model.Node
 // reporting the old tag until the remote update lands, and a leftover entry
 // that matches nothing is harmless.
 func (s *NodeService) EnsureInboundTagAllowed(nodeID int, tag string) error {
+	return s.EnsureInboundTagAllowedTx(database.GetDB(), nodeID, tag)
+}
+
+func (s *NodeService) EnsureInboundTagAllowedTx(tx *gorm.DB, nodeID int, tag string) error {
 	tag = strings.TrimSpace(tag)
 	if nodeID <= 0 || tag == "" {
 		return nil
 	}
-	db := database.GetDB()
+	if tx == nil {
+		tx = database.GetDB()
+	}
 	node := &model.Node{}
-	if err := db.Where("id = ?", nodeID).First(node).Error; err != nil {
+	if err := tx.Where("id = ?", nodeID).First(node).Error; err != nil {
 		return err
 	}
 	if node.InboundSyncMode != "selected" {
 		return nil
 	}
-	for _, t := range node.InboundTags {
-		if t == tag {
-			return nil
-		}
+	if slices.Contains(node.InboundTags, tag) {
+		return nil
 	}
 	buf, err := json.Marshal(append(node.InboundTags, tag))
 	if err != nil {
 		return err
 	}
-	return db.Model(model.Node{}).Where("id = ?", nodeID).
+	return tx.Model(model.Node{}).Where("id = ?", nodeID).
 		Updates(map[string]any{"inbound_tags": string(buf)}).Error
 }
 
@@ -397,9 +656,17 @@ func FilterNodeSnapshot(n *model.Node, snap *runtime.TrafficSnapshot) {
 	if n == nil || snap == nil || n.InboundSyncMode != "selected" {
 		return
 	}
-	allowed := make(map[string]struct{}, len(n.InboundTags))
+	prefix := nodeTagPrefix(&n.Id)
+	allowed := make(map[string]struct{}, len(n.InboundTags)*2)
 	for _, tag := range n.InboundTags {
 		allowed[tag] = struct{}{}
+		if prefix != "" {
+			if stripped, found := strings.CutPrefix(tag, prefix); found {
+				allowed[stripped] = struct{}{}
+			} else {
+				allowed[prefix+tag] = struct{}{}
+			}
+		}
 	}
 	filtered := make([]*model.Inbound, 0, len(snap.Inbounds))
 	for _, inbound := range snap.Inbounds {
@@ -415,10 +682,43 @@ func FilterNodeSnapshot(n *model.Node, snap *runtime.TrafficSnapshot) {
 
 func (s *NodeService) Delete(id int) error {
 	db := database.GetDB()
-	if err := db.Where("id = ?", id).Delete(model.Node{}).Error; err != nil {
+	// Refuse to delete a node that still owns inbounds: dropping the node row
+	// while inbounds keep its node_id leaves orphaned, dangling references that
+	// confuse node sync, subscriptions and cleanup. The operator must detach or
+	// remove those inbounds first. (DB-002)
+	var attached int64
+	if err := db.Model(&model.Inbound{}).Where("node_id = ?", id).Count(&attached).Error; err != nil {
 		return err
 	}
-	if err := db.Where("node_id = ?", id).Delete(&model.NodeClientTraffic{}).Error; err != nil {
+	if attached > 0 {
+		return common.NewError(fmt.Sprintf("cannot delete node: %d inbound(s) still attached to it; detach or delete them first", attached))
+	}
+	// Capture the node's guid before deleting the row so we can drop its per-node
+	// IP attribution. NodeClientIp is keyed by the node's attribution key, which
+	// is its guid normally but its node-unique key for a cloned/ambiguous-guid
+	// node (see effectiveNodeKey) — so we purge both below.
+	var guid string
+	var n model.Node
+	if err := db.Select("guid").Where("id = ?", id).First(&n).Error; err == nil {
+		guid = n.Guid
+	}
+	// Delete the node row and its per-node child rows atomically. Remove the
+	// children (traffic baselines, IP attribution) before the parent node row so
+	// the ordering already matches a future ON DELETE constraint. Delete stays
+	// tolerant of a missing node row so it can still clean up orphaned baselines.
+	if err := db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Where("node_id = ?", id).Delete(&model.NodeClientTraffic{}).Error; err != nil {
+			return err
+		}
+		guids := []string{synthNodeGuid(id)}
+		if guid != "" {
+			guids = append(guids, guid)
+		}
+		if err := tx.Where("node_guid IN ?", guids).Delete(&model.NodeClientIp{}).Error; err != nil {
+			return err
+		}
+		return tx.Where("id = ?", id).Delete(&model.Node{}).Error
+	}); err != nil {
 		return err
 	}
 	if mgr := runtime.GetManager(); mgr != nil {
@@ -476,7 +776,7 @@ type NodeUpdateResult struct {
 // UpdatePanels triggers the official self-updater on each given node. Only
 // enabled, online nodes are eligible — an offline node can't be reached, so it
 // is reported as skipped rather than silently dropped.
-func (s *NodeService) UpdatePanels(ids []int) ([]NodeUpdateResult, error) {
+func (s *NodeService) UpdatePanels(ids []int, dev bool) ([]NodeUpdateResult, error) {
 	mgr := runtime.GetManager()
 	if mgr == nil {
 		return nil, fmt.Errorf("runtime manager unavailable")
@@ -501,7 +801,7 @@ func (s *NodeService) UpdatePanels(ids []int) ([]NodeUpdateResult, error) {
 				break
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-			updErr := remote.UpdatePanel(ctx)
+			updErr := remote.UpdatePanel(ctx, dev)
 			cancel()
 			if updErr != nil {
 				res.Error = updErr.Error()
@@ -525,6 +825,8 @@ func (s *NodeService) UpdateHeartbeat(id int, p HeartbeatPatch) error {
 		"cpu_pct":        p.CpuPct,
 		"mem_pct":        p.MemPct,
 		"uptime_secs":    p.UptimeSecs,
+		"net_up":         p.NetUp,
+		"net_down":       p.NetDown,
 		"last_error":     p.LastError,
 		"xray_state":     p.XrayState,
 		"xray_error":     p.XrayError,
@@ -533,6 +835,7 @@ func (s *NodeService) UpdateHeartbeat(id int, p HeartbeatPatch) error {
 	// failed probe) reports none, so the stable identity survives blips.
 	if p.Guid != "" {
 		updates["guid"] = p.Guid
+		s.warnOnDuplicateGuid(id, p.Guid)
 	}
 	if err := db.Model(model.Node{}).Where("id = ?", id).Updates(updates).Error; err != nil {
 		return err
@@ -541,15 +844,48 @@ func (s *NodeService) UpdateHeartbeat(id int, p HeartbeatPatch) error {
 		now := time.Unix(p.LastHeartbeat, 0)
 		nodeMetrics.append(nodeMetricKey(id, "cpu"), now, p.CpuPct)
 		nodeMetrics.append(nodeMetricKey(id, "mem"), now, p.MemPct)
+		nodeMetrics.append(nodeMetricKey(id, "netUp"), now, float64(p.NetUp))
+		nodeMetrics.append(nodeMetricKey(id, "netDown"), now, float64(p.NetDown))
 	}
 	return nil
 }
 
+// warnedDupGuid remembers the (nodeID -> guid) pairs already warned about so a
+// cloned-server collision is logged once, not every heartbeat.
+var warnedDupGuid sync.Map
+
+// warnOnDuplicateGuid logs once when a node reports a panelGuid already held by
+// another node or by the master itself (the cloned-server footgun). Attribution
+// still works — it falls back to node-unique keys — but the operator should
+// regenerate the duplicate panelGuid to restore real identity and per-node IP
+// attribution. Re-arms if the collision later clears.
+func (s *NodeService) warnOnDuplicateGuid(id int, guid string) {
+	var clash int64
+	database.GetDB().Model(&model.Node{}).Where("guid = ? AND id <> ?", guid, id).Count(&clash)
+	masterGuid, _ := (&SettingService{}).GetPanelGuid()
+	if clash == 0 && guid != masterGuid {
+		warnedDupGuid.Delete(id)
+		return
+	}
+	if prev, ok := warnedDupGuid.Load(id); ok && prev == guid {
+		return
+	}
+	warnedDupGuid.Store(id, guid)
+	logger.Warningf("node %d reports panelGuid %s already used by another node or the master (cloned server?) — regenerate it on that node so online and IP attribution stay per-node", id, guid)
+}
+
 func (s *NodeService) MarkNodeDirty(id int) error {
+	return s.MarkNodeDirtyTx(database.GetDB(), id)
+}
+
+func (s *NodeService) MarkNodeDirtyTx(tx *gorm.DB, id int) error {
 	if id <= 0 {
 		return nil
 	}
-	return database.GetDB().Model(model.Node{}).
+	if tx == nil {
+		return errors.New("nil db transaction")
+	}
+	return tx.Model(model.Node{}).
 		Where("id = ?", id).
 		Updates(map[string]any{
 			"config_dirty":    true,
@@ -564,6 +900,15 @@ func (s *NodeService) ClearNodeDirty(id int, dirtyAt int64) error {
 	return database.GetDB().Model(model.Node{}).
 		Where("id = ? AND config_dirty_at = ?", id, dirtyAt).
 		Update("config_dirty", false).Error
+}
+
+func (s *NodeService) MarkNodeInboundsAdopted(id int) error {
+	if id <= 0 {
+		return nil
+	}
+	return database.GetDB().Model(model.Node{}).
+		Where("id = ? AND inbounds_adopted_at = 0", id).
+		Update("inbounds_adopted_at", time.Now().Unix()).Error
 }
 
 func (s *NodeService) NodeSyncState(id int) (enabled bool, status string, dirty bool, dirtyAt int64, err error) {
@@ -581,12 +926,19 @@ func (s *NodeService) NodeSyncState(id int) (enabled bool, status string, dirty 
 	return row.Enable, row.Status, row.ConfigDirty, row.ConfigDirtyAt, nil
 }
 
+// IsNodePending reports whether a save targeting this node was deferred because
+// the node is unreachable right now — offline or disabled — so the edit only
+// reaches it on the next reconcile. It deliberately ignores config_dirty: that
+// flag is set on EVERY node-backed edit as the reconcile self-heal marker,
+// including edits pushed live to an online node, so keying the user-facing
+// "saved, node offline, will sync" toast off it fired the warning on every save
+// to a perfectly healthy online node.
 func (s *NodeService) IsNodePending(id int) bool {
-	enabled, status, dirty, _, err := s.NodeSyncState(id)
+	enabled, status, _, _, err := s.NodeSyncState(id)
 	if err != nil {
 		return false
 	}
-	return !enabled || status != "online" || dirty
+	return !enabled || status != "online"
 }
 
 func nodeMetricKey(id int, metric string) string {
@@ -611,23 +963,46 @@ func (s *NodeService) ProbeWithOutbound(ctx context.Context, n *model.Node, outb
 	if outboundTag == "" {
 		return s.Probe(ctx, n)
 	}
+	var patch HeartbeatPatch
+	var err error
+	s.withOutboundBridge(n.Id, outboundTag, func(proxyURL string) {
+		if proxyURL == "" {
+			patch, err = s.Probe(ctx, n)
+			return
+		}
+		patch, err = s.probe(ctx, n, proxyURL)
+	})
+	return patch, err
+}
+
+// withOutboundBridge stands up a temporary loopback SOCKS5 inbound in the
+// running Xray, routes it through outboundTag, and runs fn with the bridge's
+// proxy URL before tearing it down. It is used to reach a node through its
+// connection outbound before the persistent egress bridge has been injected
+// into the config (e.g. while the node is still being added or edited). When
+// Xray isn't running or the bridge can't be built, fn runs with an empty
+// proxyURL so callers fall back to a direct connection.
+func (s *NodeService) withOutboundBridge(nodeID int, outboundTag string, fn func(proxyURL string)) {
 	proc := XrayProcess()
 	if proc == nil || !proc.IsRunning() {
-		return s.Probe(ctx, n)
+		fn("")
+		return
 	}
 	apiPort := proc.GetAPIPort()
 	if apiPort <= 0 {
-		return s.Probe(ctx, n)
+		fn("")
+		return
 	}
 
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	listener, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", "127.0.0.1:0")
 	if err != nil {
-		return s.Probe(ctx, n)
+		fn("")
+		return
 	}
 	port := listener.Addr().(*net.TCPAddr).Port
 	listener.Close()
 
-	tag := fmt.Sprintf("node-test-%d-%d", n.Id, time.Now().UnixNano())
+	tag := fmt.Sprintf("node-test-%d-%d", nodeID, time.Now().UnixNano())
 	proxyURL := fmt.Sprintf("socks5://127.0.0.1:%d", port)
 
 	inboundJSON, err := json.Marshal(xray.InboundConfig{
@@ -638,7 +1013,8 @@ func (s *NodeService) ProbeWithOutbound(ctx context.Context, n *model.Node, outb
 		Tag:      tag,
 	})
 	if err != nil {
-		return s.Probe(ctx, n)
+		fn("")
+		return
 	}
 
 	cfg := proc.GetConfig()
@@ -659,31 +1035,31 @@ func (s *NodeService) ProbeWithOutbound(ctx context.Context, n *model.Node, outb
 	routing["rules"] = append([]any{rule}, rules...)
 	routingJSON, err := json.Marshal(routing)
 	if err != nil {
-		return s.Probe(ctx, n)
+		fn("")
+		return
 	}
 	originalRoutingJSON := cfg.RouterConfig
 
 	api := xray.XrayAPI{}
 	if err := api.Init(apiPort); err != nil {
-		return s.Probe(ctx, n)
+		fn("")
+		return
 	}
 	defer api.Close()
 
 	if err := api.AddInbound(inboundJSON); err != nil {
-		return s.Probe(ctx, n)
+		fn("")
+		return
 	}
-	removed := false
 	defer func() {
-		if removed {
-			return
-		}
 		if err := api.DelInbound(tag); err != nil {
-			logger.Warning("remove temp node test inbound failed:", err)
+			logger.Warning("remove temp node bridge inbound failed:", err)
 		}
 	}()
 
 	if err := api.ApplyRoutingConfig(routingJSON); err != nil {
-		return s.Probe(ctx, n)
+		fn("")
+		return
 	}
 	defer func() {
 		restore := originalRoutingJSON
@@ -691,19 +1067,11 @@ func (s *NodeService) ProbeWithOutbound(ctx context.Context, n *model.Node, outb
 			restore = []byte("{}")
 		}
 		if err := api.ApplyRoutingConfig(restore); err != nil {
-			logger.Warning("restore routing after node test failed:", err)
+			logger.Warning("restore routing after node bridge failed:", err)
 		}
 	}()
 
-	patch, err := s.probe(ctx, n, proxyURL)
-	removed = true
-	if delErr := api.DelInbound(tag); delErr != nil {
-		logger.Warning("remove temp node test inbound failed:", delErr)
-	}
-	if err != nil {
-		return patch, err
-	}
-	return patch, nil
+	fn(proxyURL)
 }
 
 func (s *NodeService) probe(ctx context.Context, n *model.Node, proxyURL string) (HeartbeatPatch, error) {
@@ -777,6 +1145,10 @@ func (s *NodeService) probe(ctx context.Context, n *model.Node, proxyURL string)
 			PanelVersion string `json:"panelVersion"`
 			PanelGuid    string `json:"panelGuid"`
 			Uptime       uint64 `json:"uptime"`
+			NetIO        struct {
+				Up   uint64 `json:"up"`
+				Down uint64 `json:"down"`
+			} `json:"netIO"`
 		} `json:"obj"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&envelope); err != nil {
@@ -798,6 +1170,8 @@ func (s *NodeService) probe(ctx context.Context, n *model.Node, proxyURL string)
 	patch.PanelVersion = o.PanelVersion
 	patch.Guid = o.PanelGuid
 	patch.UptimeSecs = o.Uptime
+	patch.NetUp = o.NetIO.Up
+	patch.NetDown = o.NetIO.Down
 	return patch, nil
 }
 

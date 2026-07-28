@@ -32,11 +32,10 @@ func TestSubscriptionExpiryFromClient(t *testing.T) {
 func TestGenRemarkOmitsNodeName(t *testing.T) {
 	nodeID := 7
 	s := &SubService{
-		remarkModel: "-ieo",
-		nodesByID:   map[int]*model.Node{7: {Id: 7, Name: "Berlin", Address: "node7.example.com"}},
+		nodesByID: map[int]*model.Node{7: {Id: 7, Name: "Berlin", Address: "node7.example.com"}},
 	}
 	ib := &model.Inbound{Remark: "vless-tcp", NodeID: &nodeID}
-	if got := s.genRemark(ib, "", ""); got != "vless-tcp" {
+	if got := s.genRemark(ib, "", "", ""); got != "vless-tcp" {
 		t.Fatalf("remark = %q, want %q (node name must not leak into client-visible remarks)", got, "vless-tcp")
 	}
 }
@@ -96,6 +95,7 @@ func TestListenIsInternalOnly(t *testing.T) {
 }
 
 func TestResolveInboundAddress(t *testing.T) {
+	initSubDB(t)
 	const reqHost = "sub.example.com"
 
 	// A routable bind Listen (a real IP or hostname the operator set as the
@@ -370,8 +370,10 @@ func TestBuildXhttpExtra_IncludesClientSideFieldsWhenPresent(t *testing.T) {
 			t.Fatalf("extra missing %q: %#v", key, extra)
 		}
 	}
-	if _, ok := extra["mode"]; ok {
-		t.Fatalf("mode should stay as a top-level query parameter, got extra %#v", extra)
+	// mode rides inside extra (in addition to the flat param) so clients
+	// that only read the extra JSON keep the xhttp mode (#5446).
+	if extra["mode"] != "packet-up" {
+		t.Fatalf("extra[mode] = %#v, want packet-up", extra["mode"])
 	}
 
 	headers, ok := extra["headers"].(map[string]any)
@@ -423,6 +425,25 @@ func TestCloneStringMap_Empty(t *testing.T) {
 	}
 	if len(dst) != 0 {
 		t.Fatalf("clone of empty map should be empty, got %v", dst)
+	}
+}
+
+func TestJoinHostPort(t *testing.T) {
+	cases := []struct {
+		host string
+		port int
+		want string
+	}{
+		{"example.com", 443, "example.com:443"},
+		{"1.2.3.4", 443, "1.2.3.4:443"},
+		{"2001:db8::1", 443, "[2001:db8::1]:443"},
+		{"[2001:db8::1]", 443, "[2001:db8::1]:443"},
+		{"2001:db8::1", 8080, "[2001:db8::1]:8080"},
+	}
+	for _, c := range cases {
+		if got := joinHostPort(c.host, c.port); got != c.want {
+			t.Fatalf("joinHostPort(%q, %d) = %q, want %q", c.host, c.port, got, c.want)
+		}
 	}
 }
 
@@ -995,6 +1016,21 @@ func TestMarshalFinalMask_UnknownTypeIsDropped(t *testing.T) {
 	}
 }
 
+func TestMarshalFinalMask_KeepsXmcTcpMask(t *testing.T) {
+	fm := map[string]any{
+		"tcp": []any{
+			map[string]any{"type": "xmc", "settings": map[string]any{"password": "p"}},
+		},
+	}
+	out, ok := marshalFinalMask(fm)
+	if !ok {
+		t.Fatal("expected ok=true for an xmc tcp mask")
+	}
+	if !strings.Contains(out, "xmc") {
+		t.Fatalf("marshaled finalmask dropped the xmc mask: %s", out)
+	}
+}
+
 func TestHasFinalMaskContent(t *testing.T) {
 	if hasFinalMaskContent(nil) {
 		t.Fatal("nil should not count as content")
@@ -1072,5 +1108,34 @@ func TestHysteriaHopPorts(t *testing.T) {
 				t.Fatalf("hysteriaHopPorts() = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestGenHysteriaLinkOmitsFinalMaskQueryParam(t *testing.T) {
+	stream := `{
+		"security":"tls",
+		"tlsSettings":{"serverName":"hy.sni","alpn":["h3"],"settings":{"fingerprint":"chrome"}},
+		"finalmask":{"udp":[{"type":"salamander","settings":{"password":"obfs-secret"}}]}
+	}`
+	in := &model.Inbound{
+		Listen:         "203.0.113.1",
+		Port:           443,
+		Protocol:       model.Hysteria,
+		Remark:         "hy2",
+		Settings:       `{"version":2,"clients":[{"auth":"hyauth","email":"user"}]}`,
+		StreamSettings: stream,
+	}
+	got := (&SubService{}).genHysteriaLink(in, "user")
+	if got == "" {
+		t.Fatal("expected hysteria2 link")
+	}
+	if strings.Contains(got, "fm=") {
+		t.Fatalf("hysteria2 subscription URI must not include non-standard fm param: %s", got)
+	}
+	if !strings.Contains(got, "obfs=salamander") {
+		t.Fatalf("missing standard obfs=salamander: %s", got)
+	}
+	if !strings.Contains(got, "obfs-password=obfs-secret") {
+		t.Fatalf("missing standard obfs-password: %s", got)
 	}
 }

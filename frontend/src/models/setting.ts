@@ -13,29 +13,35 @@ export class AllSetting {
   pageSize = 25;
   expireDiff = 0;
   trafficDiff = 0;
-  remarkModel = '-io';
+  remarkTemplate = '{{INBOUND}}-{{EMAIL}}|📊{{TRAFFIC_LEFT}}|⏳{{DAYS_LEFT}}D';
   datepicker: 'gregorian' | 'jalalian' = 'gregorian';
   tgBotEnable = false;
   tgBotToken = '';
-  tgBotProxy = '';
   tgBotAPIServer = '';
   tgBotChatId = '';
   tgRunTime = '@daily';
   tgBotBackup = false;
-  tgBotLoginNotify = true;
   tgCpu = 80;
+  tgMemory = 80;
   tgLang = 'en-US';
   twoFactorEnable = false;
   twoFactorToken = '';
   xrayTemplateConfig = '';
   subEnable = true;
   subJsonEnable = false;
+  subJsonAutoDetect = false;
+  subJsonAlwaysArray = false;
+  subJsonUserAgentRegex = '';
+  subClashAutoDetect = false;
+  subClashUserAgentRegex = '';
   subTitle = '';
   subSupportUrl = '';
   subProfileUrl = '';
   subAnnounce = '';
   subEnableRouting = false;
   subRoutingRules = '';
+  subIncyEnableRouting = false;
+  subIncyRoutingRules = '';
   subListen = '';
   subPort = 2096;
   subPath = '/sub/';
@@ -50,8 +56,6 @@ export class AllSetting {
   subKeyFile = '';
   subUpdates = 12;
   subEncrypt = true;
-  subShowInfo = true;
-  subEmailInRemark = true;
   subURI = '';
   subJsonURI = '';
   subClashURI = '';
@@ -61,6 +65,7 @@ export class AllSetting {
   subJsonRules = '';
   subJsonFinalMask = '';
   subThemeDir = '';
+  subHideSettings = false;
 
   timeLocation = 'Local';
 
@@ -68,6 +73,7 @@ export class AllSetting {
   ldapHost = '';
   ldapPort = 389;
   ldapUseTLS = false;
+  ldapInsecureSkipVerify = false;
   ldapBindDN = '';
   ldapPassword = '';
   ldapBaseDN = '';
@@ -84,12 +90,30 @@ export class AllSetting {
   ldapDefaultTotalGB = 0;
   ldapDefaultExpiryDays = 0;
   ldapDefaultLimitIP = 0;
+  tgEnabledEvents = '';
+  smtpEnable = false;
+  smtpHost = '';
+  smtpPort = 587;
+  smtpUsername = '';
+  smtpPassword = '';
+  smtpFrom = '';
+  smtpFromName = '';
+  smtpTo = '';
+  smtpEncryptionType = 'starttls';
+  smtpEnabledEvents = '';
+  smtpCpu = 80;
+  smtpMemory = 80;
+  outboundDownThreshold = 3;
   hasTgBotToken = false;
   hasTwoFactorToken = false;
   hasLdapPassword = false;
   hasApiToken = false;
   hasWarpSecret = false;
   hasNordSecret = false;
+  hasSmtpPassword = false;
+  clearTgBotToken = false;
+  clearLdapPassword = false;
+  clearSmtpPassword = false;
 
   constructor(data?: unknown) {
     if (data != null) {
@@ -97,6 +121,8 @@ export class AllSetting {
     }
     const cpu = Math.round(Number(this.tgCpu));
     this.tgCpu = Number.isFinite(cpu) ? Math.min(100, Math.max(0, cpu)) : 80;
+    const threshold = Math.round(Number(this.outboundDownThreshold));
+    this.outboundDownThreshold = Number.isFinite(threshold) ? Math.min(100, Math.max(1, threshold)) : 3;
   }
 
   equals(other: AllSetting): boolean {

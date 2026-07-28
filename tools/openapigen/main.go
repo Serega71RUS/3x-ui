@@ -38,6 +38,7 @@ func run(root, outDir string) error {
 				"ClientRecord",
 				"ClientInbound",
 				"InboundFallback",
+				"Host",
 			),
 			AliasAllow: setOf("Protocol"),
 			Overrides: map[string][]walkOverride{
@@ -52,6 +53,10 @@ func run(root, outDir string) error {
 				"InboundClientIps": {
 					{Field: "Ips", Kind: KindAny},
 				},
+				"Host": {
+					{Field: "MuxParams", Kind: KindAny},
+					{Field: "SockoptParams", Kind: KindAny},
+				},
 			},
 		},
 		{
@@ -60,6 +65,7 @@ func run(root, outDir string) error {
 				"Msg",
 				"AllSetting",
 				"AllSettingView",
+				"HostGroup",
 			),
 		},
 		{
@@ -72,12 +78,15 @@ func run(root, outDir string) error {
 			Path: resolveRel(root, "internal/web/service"),
 			StructAllow: setOf(
 				"InboundOption",
+				"NodeMutationRequest",
+				"NodeView",
 				"ProbeResultUI",
+				"RealityScanResult",
 			),
 		},
 		{
 			Path:        resolveRel(root, "internal/web/service/panel"),
-			StructAllow: setOf("ApiTokenView"),
+			StructAllow: setOf("ApiTokenView", "PanelUpdateStatus"),
 		},
 	}
 

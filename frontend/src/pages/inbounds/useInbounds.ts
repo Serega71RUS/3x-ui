@@ -13,6 +13,7 @@ import { OnlinesSchema, OnlineByNodeSchema, ActiveInboundsByNodeSchema } from '@
 import { DefaultsPayloadSchema, type DefaultsPayload } from '@/schemas/defaults';
 
 import type { InboundSpeedEntry } from './list/types';
+import { TRAFFIC_POLL_INTERVAL_S } from '@/lib/traffic/poll-interval';
 
 export interface SubSettings {
   enable: boolean;
@@ -28,9 +29,13 @@ export interface SubSettings {
 
 type DBInboundInstance = InstanceType<typeof DBInbound>;
 
-// Server-side traffic polling interval in seconds. XrayTrafficJob broadcasts
-// deltas accumulated over this window, so dividing by it yields bytes/sec.
-const TRAFFIC_POLL_INTERVAL_S = 5;
+// Speed is delta-derived, so it can't be recomputed until the first poll after
+// mount; navigating away and back would otherwise blank the column for up to one
+// poll. Cache the last speed map across mounts (module scope) and reseed from it
+// while recent, so returning to the page shows the last throughput immediately
+// and the next poll refreshes it.
+const SPEED_CACHE_TTL_MS = 15000;
+let inboundSpeedCache: { at: number; data: Record<number, InboundSpeedEntry> } = { at: 0, data: {} };
 
 interface TrafficDelta {
   Tag: string;
@@ -55,6 +60,8 @@ const TRACKED_PROTOCOLS: readonly string[] = [
   Protocols.TROJAN,
   Protocols.SHADOWSOCKS,
   Protocols.HYSTERIA,
+  Protocols.WIREGUARD,
+  Protocols.MTPROTO,
 ];
 
 async function fetchSlimInbounds(): Promise<unknown[]> {
@@ -161,7 +168,6 @@ export function useInbounds() {
   const tgBotEnable = !!defaults.tgBotEnable;
   const ipLimitEnable = !!defaults.ipLimitEnable;
   const pageSize = defaults.pageSize ?? 0;
-  const remarkModel = defaults.remarkModel || '-io';
   const datepicker = (defaults.datepicker as 'gregorian' | 'jalalian') || 'gregorian';
 
   const subSettings: SubSettings = useMemo(() => ({
@@ -192,7 +198,12 @@ export function useInbounds() {
   const [clientCount, setClientCount] = useState<Record<number, ClientRollup>>({});
   const [statsVersion, setStatsVersion] = useState(0);
 
-  const [inboundSpeed, setInboundSpeed] = useState<Record<number, InboundSpeedEntry>>({});
+  const [inboundSpeed, setInboundSpeed] = useState<Record<number, InboundSpeedEntry>>(() =>
+    Date.now() - inboundSpeedCache.at < SPEED_CACHE_TTL_MS ? inboundSpeedCache.data : {},
+  );
+  useEffect(() => {
+    inboundSpeedCache = { at: Date.now(), data: inboundSpeed };
+  }, [inboundSpeed]);
 
   const [onlineClients, setOnlineClients] = useState<string[]>([]);
   const onlineClientsRef = useRef<string[]>([]);
@@ -400,6 +411,7 @@ export function useInbounds() {
       if (!payload || typeof payload !== 'object') return;
       const p = payload as {
         traffics?: TrafficDelta[];
+        nodeTraffics?: TrafficDelta[];
         onlineClients?: string[];
         onlineByGuid?: Record<string, string[]>;
         activeInbounds?: Record<string, string[]>;
@@ -418,26 +430,40 @@ export function useInbounds() {
       if (p.lastOnlineMap && typeof p.lastOnlineMap === 'object') {
         setLastOnlineMap((prev) => ({ ...prev, ...p.lastOnlineMap! }));
       }
-      // Full-replace each poll so idle inbounds (and an empty array after an
-      // Xray stat reset) clear their speed instead of showing a stale value.
-      if (Array.isArray(p.traffics)) {
+      // Speed arrives from two independent 5s polls: the local Xray poll sends
+      // `traffics` (local inbounds) and the node sync sends `nodeTraffics` (node
+      // inbounds). Each replaces speed only within its own scope so the two don't
+      // clobber each other; an idle in-scope inbound — absent from its payload —
+      // clears instead of showing a stale value.
+      const applyTraffics = (
+        traffics: TrafficDelta[],
+        inScope: (ib: DBInboundInstance) => boolean,
+      ) => {
         const byTag = new Map<string, TrafficDelta>();
-        for (const tr of p.traffics) {
+        for (const tr of traffics) {
           if (!tr || typeof tr.Tag !== 'string') continue;
           if (tr.IsInbound === false) continue;
           byTag.set(tr.Tag, tr);
         }
-        const nextSpeed: Record<number, InboundSpeedEntry> = {};
-        for (const ib of dbInboundsRef.current) {
-          const delta = byTag.get(ib.tag);
-          if (!delta) continue;
-          nextSpeed[ib.id] = {
-            up: (delta.Up || 0) / TRAFFIC_POLL_INTERVAL_S,
-            down: (delta.Down || 0) / TRAFFIC_POLL_INTERVAL_S,
-          };
-        }
-        setInboundSpeed(nextSpeed);
-      }
+        setInboundSpeed((prev) => {
+          const next = { ...prev };
+          for (const ib of dbInboundsRef.current) {
+            if (!inScope(ib)) continue;
+            const delta = byTag.get(ib.tag);
+            if (delta) {
+              next[ib.id] = {
+                up: (delta.Up || 0) / TRAFFIC_POLL_INTERVAL_S,
+                down: (delta.Down || 0) / TRAFFIC_POLL_INTERVAL_S,
+              };
+            } else {
+              delete next[ib.id];
+            }
+          }
+          return next;
+        });
+      };
+      if (Array.isArray(p.traffics)) applyTraffics(p.traffics, (ib) => ib.nodeId == null);
+      if (Array.isArray(p.nodeTraffics)) applyTraffics(p.nodeTraffics, (ib) => ib.nodeId != null);
       rebuildClientCount();
     },
     [rebuildClientCount],
@@ -528,7 +554,6 @@ export function useInbounds() {
     expireDiff,
     trafficDiff,
     subSettings,
-    remarkModel,
     datepicker,
     tgBotEnable,
     ipLimitEnable,

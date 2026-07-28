@@ -1,6 +1,6 @@
-import axios from 'axios';
-import type { AxiosError, AxiosRequestConfig, AxiosResponse } from 'axios';
 import i18next from 'i18next';
+import { httpRequest } from '@/api/http-init';
+import type { HttpResponse } from '@/api/http-init';
 import { getMessage } from './messageBus';
 
 type RespEnvelope = { success?: unknown; msg?: unknown; obj?: unknown };
@@ -17,8 +17,13 @@ export class Msg<T = unknown> {
   }
 }
 
-export interface HttpOptions extends AxiosRequestConfig {
+export interface HttpOptions {
+  headers?: Record<string, string> | Headers;
+  params?: unknown;
+  timeout?: number;
+  signal?: AbortSignal;
   silent?: boolean;
+  silentSuccess?: boolean;
 }
 
 export interface HttpModal {
@@ -27,23 +32,27 @@ export interface HttpModal {
 }
 
 export class HttpUtil {
-  static _handleMsg(msg: unknown): void {
+  static _handleMsg(msg: unknown, silentSuccess = false): void {
     if (!(msg instanceof Msg) || msg.msg === '') {
       return;
     }
-    const messageType = msg.success ? 'success' : 'error';
-    getMessage()[messageType](msg.msg);
-    if (
-      msg.success &&
-      msg.obj &&
-      typeof msg.obj === 'object' &&
-      (msg.obj as { nodePending?: unknown }).nodePending === true
-    ) {
-      getMessage().warning(i18next.t('pages.inbounds.toasts.savedNodeOfflineWillSync'));
+    if (msg.success) {
+      if (!silentSuccess) {
+        getMessage().success(msg.msg);
+      }
+      if (
+        msg.obj &&
+        typeof msg.obj === 'object' &&
+        (msg.obj as { nodePending?: unknown }).nodePending === true
+      ) {
+        getMessage().warning(i18next.t('pages.inbounds.toasts.savedNodeOfflineWillSync'));
+      }
+      return;
     }
+    getMessage().error(msg.msg);
   }
 
-  static _respToMsg(resp: AxiosResponse | undefined): Msg {
+  static _respToMsg(resp: HttpResponse | undefined): Msg {
     if (!resp || !resp.data) {
       return new Msg(false, 'No response data');
     }
@@ -59,32 +68,34 @@ export class HttpUtil {
   }
 
   static async get<T = unknown>(url: string, params?: unknown, options: HttpOptions = {}): Promise<Msg<T>> {
-    const { silent, ...axiosOpts } = options;
+    const { silent, silentSuccess, ...rest } = options;
     try {
-      const resp = await axios.get(url, { params, ...axiosOpts });
+      const resp = await httpRequest('GET', url, undefined, { ...rest, params });
       const msg = this._respToMsg(resp) as Msg<T>;
-      if (!silent) this._handleMsg(msg);
+      if (!silent) this._handleMsg(msg, silentSuccess);
       return msg;
     } catch (error) {
       console.error('GET request failed:', error);
-      const err = error as AxiosError<{ message?: string }>;
-      const errorMsg = new Msg<T>(false, err.response?.data?.message || err.message || 'Request failed');
+      const err = error as { response?: { data?: { msg?: string; message?: string } }; message?: string };
+      const data = err.response?.data;
+      const errorMsg = new Msg<T>(false, data?.msg || data?.message || err.message || 'Request failed');
       if (!silent) this._handleMsg(errorMsg);
       return errorMsg;
     }
   }
 
   static async post<T = unknown>(url: string, data?: unknown, options: HttpOptions = {}): Promise<Msg<T>> {
-    const { silent, ...axiosOpts } = options;
+    const { silent, silentSuccess, ...rest } = options;
     try {
-      const resp = await axios.post(url, data, axiosOpts);
+      const resp = await httpRequest('POST', url, data, rest);
       const msg = this._respToMsg(resp) as Msg<T>;
-      if (!silent) this._handleMsg(msg);
+      if (!silent) this._handleMsg(msg, silentSuccess);
       return msg;
     } catch (error) {
       console.error('POST request failed:', error);
-      const err = error as AxiosError<{ message?: string }>;
-      const errorMsg = new Msg<T>(false, err.response?.data?.message || err.message || 'Request failed');
+      const err = error as { response?: { data?: { msg?: string; message?: string } }; message?: string };
+      const data = err.response?.data;
+      const errorMsg = new Msg<T>(false, data?.msg || data?.message || err.message || 'Request failed');
       if (!silent) this._handleMsg(errorMsg);
       return errorMsg;
     }
@@ -632,8 +643,10 @@ export class Base64 {
   }
 
   static decode(content: string = ''): string {
+    const normalized = content.replace(/-/g, '+').replace(/_/g, '/');
+    const padded = normalized.padEnd(Math.ceil(normalized.length / 4) * 4, '=');
     return new TextDecoder().decode(
-      Uint8Array.from(window.atob(content), (c) => c.charCodeAt(0)),
+      Uint8Array.from(window.atob(padded), (c) => c.charCodeAt(0)),
     );
   }
 }
@@ -920,6 +933,8 @@ export type CalendarKind = 'gregorian' | 'jalalian';
 export class IntlUtil {
   static formatDate(date: string | number | Date | null | undefined, calendar: CalendarKind = 'gregorian'): string {
     if (date == null) return '';
+    const d = new Date(date);
+    if (!isFinite(d.getTime())) return '';
     const language = LanguageManager.getLanguage();
     const locale = calendar === 'jalalian' ? 'fa-IR' : language;
 
@@ -934,11 +949,12 @@ export class IntlUtil {
     };
 
     const intl = new Intl.DateTimeFormat(locale, intlOptions);
-    return intl.format(new Date(date));
+    return intl.format(d);
   }
 
   static formatRelativeTime(date: number | null | undefined): string {
     if (date == null) return '';
+    if (!isFinite(date)) return '';
     const language = LanguageManager.getLanguage();
     const now = new Date();
     const diff = date < 0

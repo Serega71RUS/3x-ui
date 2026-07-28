@@ -24,7 +24,7 @@ import {
 
 import { HttpUtil, SizeFormatter, RandomUtil } from '@/utils';
 import { createDefaultInboundSettings } from '@/lib/xray/inbound-defaults';
-import { genInboundLinks, preferPublicHost } from '@/lib/xray/inbound-link';
+import { genInboundLinks, genWireguardLinks, preferPublicHost } from '@/lib/xray/inbound-link';
 import { inboundFromDb } from '@/lib/xray/inbound-from-db';
 import { coerceInboundJsonField, type DBInbound } from '@/models/dbinbound';
 import { useTheme } from '@/hooks/useTheme';
@@ -33,6 +33,7 @@ import { useWebSocket } from '@/hooks/useWebSocket';
 import { useNodesQuery } from '@/api/queries/useNodesQuery';
 import AppSidebar from '@/layouts/AppSidebar';
 const TextModal = lazy(() => import('@/components/feedback/TextModal'));
+import type { TextModalTab } from '@/components/feedback/TextModal';
 const PromptModal = lazy(() => import('@/components/feedback/PromptModal'));
 
 import { useInbounds } from './useInbounds';
@@ -90,7 +91,6 @@ export default function InboundsPage() {
     subSettings,
     tgBotEnable,
     ipLimitEnable,
-    remarkModel,
     refresh,
     hydrateInbound,
     applyTrafficEvent,
@@ -101,7 +101,7 @@ export default function InboundsPage() {
   const [messageApi, messageContextHolder] = message.useMessage();
   useEffect(() => { setMessageInstance(messageApi); }, [messageApi]);
 
-  const { nodes: nodesList } = useNodesQuery();
+  const { nodes: nodesList, fetched: nodesFetched } = useNodesQuery();
   const nodesById = useMemo(() => {
     const map = new Map<number, ReturnType<typeof useNodesQuery>['nodes'][number]>();
     for (const n of nodesList || []) map.set(n.id, n);
@@ -149,6 +149,7 @@ export default function InboundsPage() {
   const [textContent, setTextContent] = useState('');
   const [textFileName, setTextFileName] = useState('');
   const [textJson, setTextJson] = useState(false);
+  const [textTabs, setTextTabs] = useState<TextModalTab[] | undefined>(undefined);
 
   const [promptOpen, setPromptOpen] = useState(false);
   const [promptTitle, setPromptTitle] = useState('');
@@ -167,11 +168,12 @@ export default function InboundsPage() {
   const infoNodeAddress = useMemo(() => hostOverrideFor(infoDbInbound), [infoDbInbound, hostOverrideFor]);
   const qrNodeAddress = useMemo(() => hostOverrideFor(qrDbInbound), [qrDbInbound, hostOverrideFor]);
 
-  const openText = useCallback((opts: { title: string; content: string; fileName?: string; json?: boolean }) => {
+  const openText = useCallback((opts: { title: string; content: string; fileName?: string; json?: boolean; tabs?: TextModalTab[] }) => {
     setTextTitle(opts.title);
     setTextContent(opts.content);
     setTextFileName(opts.fileName || '');
     setTextJson(opts.json || false);
+    setTextTabs(opts.tabs);
     setTextOpen(true);
   }, []);
 
@@ -260,18 +262,26 @@ export default function InboundsPage() {
 
   const exportInboundLinks = useCallback((dbInbound: DBInbound) => {
     const projected = checkFallback(dbInbound);
+    const genInput = {
+      inbound: inboundFromDb(projected),
+      remark: projected.remark,
+      hostOverride: hostOverrideFor(dbInbound),
+      fallbackHostname: preferPublicHost(window.location.hostname, subSettings.publicHost),
+    };
+    const content = genInboundLinks(genInput);
+    const tabs: TextModalTab[] | undefined = projected.isWireguard
+      ? [
+        { key: 'config', label: t('pages.clients.config'), content },
+        { key: 'links', label: t('pages.clients.tabLinks'), content: genWireguardLinks(genInput) },
+      ]
+      : undefined;
     openText({
       title: t('pages.inbounds.exportLinksTitle'),
-      content: genInboundLinks({
-        inbound: inboundFromDb(projected),
-        remark: projected.remark,
-        remarkModel,
-        hostOverride: hostOverrideFor(dbInbound),
-        fallbackHostname: preferPublicHost(window.location.hostname, subSettings.publicHost),
-      }),
+      content,
       fileName: projected.remark || 'inbound',
+      tabs,
     });
-  }, [checkFallback, remarkModel, hostOverrideFor, subSettings.publicHost, openText, t]);
+  }, [checkFallback, hostOverrideFor, subSettings.publicHost, openText, t]);
 
   const exportInboundClipboard = useCallback((dbInbound: DBInbound) => {
     openText({ title: t('pages.inbounds.inboundJsonTitle'), content: JSON.stringify(dbInbound, null, 2), json: true });
@@ -294,22 +304,10 @@ export default function InboundsPage() {
   }, [subSettings, openText, t]);
 
   const exportAllLinks = useCallback(async () => {
-    const hydrated = await Promise.all(
-      dbInbounds.map((ib) => hydrateInbound(ib.id).then((r) => r ?? ib)),
-    );
-    const out: string[] = [];
-    for (const ib of hydrated) {
-      const projected = checkFallback(ib);
-      out.push(genInboundLinks({
-        inbound: inboundFromDb(projected),
-        remark: projected.remark,
-        remarkModel,
-        hostOverride: hostOverrideFor(ib),
-        fallbackHostname: preferPublicHost(window.location.hostname, subSettings.publicHost),
-      }));
-    }
-    openText({ title: t('pages.inbounds.exportAllLinksTitle'), content: out.join('\r\n'), fileName: t('pages.inbounds.exportAllLinksFileName') });
-  }, [dbInbounds, hydrateInbound, checkFallback, remarkModel, hostOverrideFor, subSettings.publicHost, openText, t]);
+    const msg = await HttpUtil.get('/panel/api/inbounds/allLinks');
+    const links = msg?.success && Array.isArray(msg.obj) ? (msg.obj as string[]) : [];
+    openText({ title: t('pages.inbounds.exportAllLinksTitle'), content: links.join('\r\n'), fileName: t('pages.inbounds.exportAllLinksFileName') });
+  }, [openText, t]);
 
   const exportAllSubs = useCallback(async () => {
     const hydrated = await Promise.all(
@@ -650,6 +648,7 @@ export default function InboundsPage() {
             dbInbound={formDbInbound}
             dbInbounds={dbInbounds}
             availableNodes={nodesList}
+            availableNodesFetched={nodesFetched}
           />
         </LazyMount>
         <LazyMount when={infoOpen}>
@@ -658,7 +657,6 @@ export default function InboundsPage() {
             onClose={() => setInfoOpen(false)}
             dbInbound={infoDbInbound}
             clientIndex={infoClientIndex}
-            remarkModel={remarkModel}
             expireDiff={expireDiff}
             trafficDiff={trafficDiff}
             ipLimitEnable={ipLimitEnable}
@@ -674,7 +672,6 @@ export default function InboundsPage() {
             onClose={() => setQrOpen(false)}
             dbInbound={qrDbInbound}
             client={null}
-            remarkModel={remarkModel}
             nodeAddress={qrNodeAddress}
             subSettings={subSettings}
           />
@@ -721,6 +718,7 @@ export default function InboundsPage() {
             content={textContent}
             fileName={textFileName}
             json={textJson}
+            tabs={textTabs}
           />
         </LazyMount>
         <LazyMount when={promptOpen}>

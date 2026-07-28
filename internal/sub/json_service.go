@@ -10,6 +10,7 @@ import (
 	"github.com/mhsanaei/3x-ui/v3/internal/database/model"
 	"github.com/mhsanaei/3x-ui/v3/internal/util/json_util"
 	"github.com/mhsanaei/3x-ui/v3/internal/util/random"
+	wgutil "github.com/mhsanaei/3x-ui/v3/internal/util/wireguard"
 )
 
 //go:embed default.json
@@ -29,7 +30,7 @@ type SubJsonService struct {
 func NewSubJsonService(mux string, rules string, finalMask string, subService *SubService) *SubJsonService {
 	var configJson map[string]any
 	var defaultOutbounds []json_util.RawMessage
-	json.Unmarshal([]byte(defaultJson), &configJson)
+	_ = json.Unmarshal([]byte(defaultJson), &configJson)
 	if outboundSlices, ok := configJson["outbounds"].([]any); ok {
 		for _, defaultOutbound := range outboundSlices {
 			jsonBytes, _ := json.Marshal(defaultOutbound)
@@ -41,7 +42,7 @@ func NewSubJsonService(mux string, rules string, finalMask string, subService *S
 		var newRules []any
 		routing, _ := configJson["routing"].(map[string]any)
 		defaultRules, _ := routing["rules"].([]any)
-		json.Unmarshal([]byte(rules), &newRules)
+		_ = json.Unmarshal([]byte(rules), &newRules)
 		defaultRules = append(newRules, defaultRules...)
 		routing["rules"] = defaultRules
 		configJson["routing"] = routing
@@ -57,15 +58,14 @@ func NewSubJsonService(mux string, rules string, finalMask string, subService *S
 }
 
 // GetJson generates a JSON subscription configuration for the given subscription ID and host.
-func (s *SubJsonService) GetJson(subId string, host string) (string, string, error) {
-	// Set per-request state on the shared SubService so any
-	// resolveInboundAddress call inside picks node-aware host values.
-	s.SubService.PrepareForRequest(host)
-	inbounds, err := s.SubService.getInboundsBySubId(subId)
+func (s *SubJsonService) GetJson(subId string, host string, alwaysReturnArray bool) (string, string, error) {
+	subReq := s.SubService.ForRequest(host)
+	subReq.subscriptionBody = true
+	inbounds, err := subReq.getInboundsBySubId(subId)
 	if err != nil {
 		return "", "", err
 	}
-	externalLinks, err := s.SubService.getClientExternalLinksBySubId(subId)
+	externalLinks, err := subReq.getClientExternalLinksBySubId(subId)
 	if err != nil {
 		return "", "", err
 	}
@@ -79,15 +79,18 @@ func (s *SubJsonService) GetJson(subId string, host string) (string, string, err
 	seenEmails := make(map[string]struct{})
 	// Prepare Inbounds
 	for _, inbound := range inbounds {
-		clients := s.SubService.matchingClients(inbound, subId)
+		clients := subReq.matchingClients(inbound, subId)
 		if len(clients) == 0 {
 			continue
 		}
-		s.SubService.projectThroughFallbackMaster(inbound)
+		subReq.projectThroughFallbackMaster(inbound)
+		if hostEps := subReq.hostEndpoints(inbound, "json"); len(hostEps) > 0 {
+			injectExternalProxy(inbound, hostEps)
+		}
 
 		for _, client := range clients {
 			seenEmails[client.Email] = struct{}{}
-			configArray = append(configArray, s.getConfig(inbound, client, host)...)
+			configArray = append(configArray, s.getConfig(subReq, inbound, client, host)...)
 		}
 	}
 	for _, ext := range externalLinks {
@@ -120,11 +123,10 @@ func (s *SubJsonService) GetJson(subId string, host string) (string, string, err
 	for e := range seenEmails {
 		emails = append(emails, e)
 	}
-	traffic, _ := s.SubService.AggregateTrafficByEmails(emails)
+	traffic, _ := subReq.AggregateTrafficByEmails(emails)
 
-	// Combile outbounds
 	var finalJson []byte
-	if len(configArray) == 1 {
+	if len(configArray) == 1 && !alwaysReturnArray {
 		finalJson, _ = json.MarshalIndent(configArray[0], "", "  ")
 	} else {
 		finalJson, _ = json.MarshalIndent(configArray, "", "  ")
@@ -134,18 +136,28 @@ func (s *SubJsonService) GetJson(subId string, host string) (string, string, err
 	return string(finalJson), header, nil
 }
 
-func (s *SubJsonService) getConfig(inbound *model.Inbound, client model.Client, host string) []json_util.RawMessage {
+func (s *SubJsonService) getConfig(subReq *SubService, inbound *model.Inbound, client model.Client, host string) []json_util.RawMessage {
 	var newJsonArray []json_util.RawMessage
-	stream := s.streamData(inbound.StreamSettings)
+	stream := s.streamData(inbound.StreamSettings, subKey(client))
 
 	// When externalProxy is empty the JSON config falls back to a
 	// synthetic one whose `dest` is the host the client connects to.
 	// For node-managed inbounds we want the node's address — request
 	// host won't reach the right xray. resolveInboundAddress already
 	// implements the node→subscriber-host fallback chain.
-	defaultDest := s.SubService.resolveInboundAddress(inbound)
+	defaultDest := subReq.resolveInboundAddress(inbound)
 	if defaultDest == "" {
 		defaultDest = host
+	}
+
+	// Per-inbound xmux takes precedence over the global subJsonMux.
+	// When xmux is present inside xhttpSettings, XHTTP multiplexing
+	// is handled by xmux — don't also set the legacy outbound.Mux.
+	mux := s.mux
+	if xhttp, ok := stream["xhttpSettings"].(map[string]any); ok {
+		if _, hasXmux := xhttp["xmux"]; hasXmux {
+			mux = ""
+		}
 	}
 
 	externalProxies, ok := stream["externalProxy"].([]any)
@@ -162,13 +174,23 @@ func (s *SubJsonService) getConfig(inbound *model.Inbound, client model.Client, 
 	}
 
 	delete(stream, "externalProxy")
+	network, _ := stream["network"].(string)
 
 	for _, ep := range externalProxies {
-		extPrxy := ep.(map[string]any)
-		inbound.Listen = extPrxy["dest"].(string)
-		inbound.Port = int(extPrxy["port"].(float64))
+		extPrxy, ok := ep.(map[string]any)
+		if !ok {
+			continue
+		}
+		// Expand the host's {{VAR}} remark template for this client (no-op for
+		// the synthetic/legacy entry) before it's used as the config remark.
+		subReq.renderHostRemark(inbound, client, extPrxy, network)
+		inbound.Listen, _ = extPrxy["dest"].(string)
+		if port, ok := extPrxy["port"].(float64); ok {
+			inbound.Port = int(port)
+		}
 		newStream := cloneStreamForExternalProxy(stream)
-		switch extPrxy["forceTls"].(string) {
+		forceTls, _ := extPrxy["forceTls"].(string)
+		switch forceTls {
 		case "tls":
 			if newStream["security"] != "tls" {
 				newStream["security"] = "tls"
@@ -184,27 +206,45 @@ func (s *SubJsonService) getConfig(inbound *model.Inbound, client model.Client, 
 		if hasExternalProxy {
 			applyExternalProxyTLSToStream(extPrxy, newStream, security)
 		}
+		applyHostStreamOverrides(extPrxy, newStream)
 		streamSettings, _ := json.MarshalIndent(newStream, "", "  ")
+		hostMux := hostMuxOverride(extPrxy)
 
 		var newOutbounds []json_util.RawMessage
 
 		switch inbound.Protocol {
 		case "vmess":
-			newOutbounds = append(newOutbounds, s.genVnext(inbound, streamSettings, client))
+			newOutbounds = append(newOutbounds, s.genVnext(inbound, streamSettings, client, jsonMux(mux, hostMux)))
 		case "vless":
-			newOutbounds = append(newOutbounds, s.genVless(inbound, streamSettings, client))
+			vc := client
+			vc.ID = applyVlessRoute(client.ID, hostVlessRoute(extPrxy))
+			// Same gate the raw link and the Clash proxy apply: a flow left
+			// over from a transport Vision supported produces an outbound
+			// xray refuses to start.
+			newNetwork, _ := newStream["network"].(string)
+			if vc.Flow != "" && !vlessFlowAllowed(newNetwork, security, subReq.linkSettings(inbound)) {
+				vc.Flow = ""
+			}
+			newOutbounds = append(newOutbounds, s.genVless(subReq, inbound, streamSettings, vc, jsonMux(mux, hostMux)))
 		case "trojan", "shadowsocks":
-			newOutbounds = append(newOutbounds, s.genServer(inbound, streamSettings, client))
+			newOutbounds = append(newOutbounds, s.genServer(subReq, inbound, streamSettings, client, jsonMux(mux, hostMux)))
 		case "hysteria":
-			newOutbounds = append(newOutbounds, s.genHy(inbound, newStream, client))
+			newOutbounds = append(newOutbounds, s.genHy(inbound, newStream, client, jsonMux(mux, hostMux)))
+		case "wireguard":
+			wgOutbound := s.genWireguard(inbound, client)
+			if wgOutbound == nil {
+				continue
+			}
+			newOutbounds = append(newOutbounds, wgOutbound)
 		}
 
 		newOutbounds = append(newOutbounds, s.defaultOutbounds...)
 		newConfigJson := make(map[string]any)
 		maps.Copy(newConfigJson, s.configJson)
 
+		transport, _ := newStream["network"].(string)
 		newConfigJson["outbounds"] = newOutbounds
-		newConfigJson["remarks"] = s.SubService.genRemark(inbound, client.Email, extPrxy["remark"].(string))
+		newConfigJson["remarks"] = subReq.endpointRemark(inbound, client.Email, extPrxy, transport)
 
 		newConfig, _ := json.MarshalIndent(newConfigJson, "", "  ")
 		newJsonArray = append(newJsonArray, newConfig)
@@ -213,15 +253,25 @@ func (s *SubJsonService) getConfig(inbound *model.Inbound, client model.Client, 
 	return newJsonArray
 }
 
-func (s *SubJsonService) streamData(stream string) map[string]any {
+func (s *SubJsonService) streamData(stream string, clientKey string) map[string]any {
 	var streamSettings map[string]any
-	json.Unmarshal([]byte(stream), &streamSettings)
+	if err := json.Unmarshal([]byte(stream), &streamSettings); err != nil || streamSettings == nil {
+		streamSettings = map[string]any{}
+	}
 	security, _ := streamSettings["security"].(string)
 	switch security {
 	case "tls":
-		streamSettings["tlsSettings"] = s.tlsData(streamSettings["tlsSettings"].(map[string]any))
+		if tlsSettings, ok := streamSettings["tlsSettings"].(map[string]any); ok {
+			streamSettings["tlsSettings"] = s.tlsData(tlsSettings)
+		} else {
+			delete(streamSettings, "tlsSettings")
+		}
 	case "reality":
-		streamSettings["realitySettings"] = s.realityData(streamSettings["realitySettings"].(map[string]any))
+		if realitySettings, ok := streamSettings["realitySettings"].(map[string]any); ok {
+			streamSettings["realitySettings"] = s.realityData(realitySettings, clientKey)
+		} else {
+			delete(streamSettings, "realitySettings")
+		}
 	}
 	delete(streamSettings, "sockopt")
 
@@ -290,13 +340,18 @@ func (s *SubJsonService) tlsData(tData map[string]any) map[string]any {
 	if ech, ok := tlsClientSettings["echConfigList"].(string); ok && ech != "" {
 		tlsData["echConfigList"] = ech
 	}
-	if pins, ok := tlsClientSettings["pinnedPeerCertSha256"].([]any); ok && len(pins) > 0 {
-		tlsData["pinnedPeerCertSha256"] = pins
+	if vcn, ok := verifyPeerCertByNameValue(tlsClientSettings); ok {
+		tlsData["verifyPeerCertByName"] = vcn
+	}
+	// xray-core now parses pinnedPeerCertSha256 as a comma-separated string, not
+	// an array; emit the joined form so v2ray clients can import the config (#5401).
+	if pins, ok := pinnedSha256List(tlsClientSettings); ok {
+		tlsData["pinnedPeerCertSha256"] = strings.Join(pins, ",")
 	}
 	return tlsData
 }
 
-func (s *SubJsonService) realityData(rData map[string]any) map[string]any {
+func (s *SubJsonService) realityData(rData map[string]any, clientKey string) map[string]any {
 	rltyData := make(map[string]any, 1)
 	rltyClientSettings, _ := rData["settings"].(map[string]any)
 
@@ -305,17 +360,17 @@ func (s *SubJsonService) realityData(rData map[string]any) map[string]any {
 	rltyData["fingerprint"] = rltyClientSettings["fingerprint"]
 	rltyData["mldsa65Verify"] = rltyClientSettings["mldsa65Verify"]
 
-	// Set random data
-	rltyData["spiderX"] = "/" + random.Seq(15)
+	seed, _ := rltyClientSettings["spiderX"].(string)
+	rltyData["spiderX"] = deriveSpiderX(seed, clientKey)
 	shortIds, ok := rData["shortIds"].([]any)
 	if ok && len(shortIds) > 0 {
-		rltyData["shortId"] = shortIds[random.Num(len(shortIds))].(string)
+		rltyData["shortId"], _ = shortIds[random.Num(len(shortIds))].(string)
 	} else {
 		rltyData["shortId"] = ""
 	}
 	serverNames, ok := rData["serverNames"].([]any)
 	if ok && len(serverNames) > 0 {
-		rltyData["serverName"] = serverNames[random.Num(len(serverNames))].(string)
+		rltyData["serverName"], _ = serverNames[random.Num(len(serverNames))].(string)
 	} else {
 		rltyData["serverName"] = ""
 	}
@@ -323,20 +378,25 @@ func (s *SubJsonService) realityData(rData map[string]any) map[string]any {
 	return rltyData
 }
 
-func (s *SubJsonService) genVnext(inbound *model.Inbound, streamSettings json_util.RawMessage, client model.Client) json_util.RawMessage {
+// jsonMux picks the per-host mux override when present, else the global mux.
+func jsonMux(global, override string) string {
+	if override != "" {
+		return override
+	}
+	return global
+}
+
+func (s *SubJsonService) genVnext(inbound *model.Inbound, streamSettings json_util.RawMessage, client model.Client, mux string) json_util.RawMessage {
 	outbound := Outbound{}
 
 	outbound.Protocol = string(inbound.Protocol)
 	outbound.Tag = "proxy"
-	if s.mux != "" {
-		outbound.Mux = json_util.RawMessage(s.mux)
+	if mux != "" {
+		outbound.Mux = json_util.RawMessage(mux)
 	}
 	outbound.StreamSettings = streamSettings
 
-	security := client.Security
-	if security == "" {
-		security = "auto"
-	}
+	security := normalizeVmessSecurity(client.Security)
 	outbound.Settings = map[string]any{
 		"address":  inbound.Listen,
 		"port":     inbound.Port,
@@ -349,18 +409,17 @@ func (s *SubJsonService) genVnext(inbound *model.Inbound, streamSettings json_ut
 	return result
 }
 
-func (s *SubJsonService) genVless(inbound *model.Inbound, streamSettings json_util.RawMessage, client model.Client) json_util.RawMessage {
+func (s *SubJsonService) genVless(subReq *SubService, inbound *model.Inbound, streamSettings json_util.RawMessage, client model.Client, mux string) json_util.RawMessage {
 	outbound := Outbound{}
 	outbound.Protocol = string(inbound.Protocol)
 	outbound.Tag = "proxy"
-	if s.mux != "" {
-		outbound.Mux = json_util.RawMessage(s.mux)
+	if mux != "" {
+		outbound.Mux = json_util.RawMessage(mux)
 	}
 	outbound.StreamSettings = streamSettings
 
 	// Add encryption for VLESS outbound from inbound settings
-	var inboundSettings map[string]any
-	json.Unmarshal([]byte(inbound.Settings), &inboundSettings)
+	inboundSettings := subReq.linkSettings(inbound)
 	encryption, _ := inboundSettings["encryption"].(string)
 
 	settings := map[string]any{
@@ -378,7 +437,7 @@ func (s *SubJsonService) genVless(inbound *model.Inbound, streamSettings json_ut
 	return result
 }
 
-func (s *SubJsonService) genServer(inbound *model.Inbound, streamSettings json_util.RawMessage, client model.Client) json_util.RawMessage {
+func (s *SubJsonService) genServer(subReq *SubService, inbound *model.Inbound, streamSettings json_util.RawMessage, client model.Client, mux string) json_util.RawMessage {
 	outbound := Outbound{}
 
 	serverData := make([]ServerSetting, 1)
@@ -390,8 +449,7 @@ func (s *SubJsonService) genServer(inbound *model.Inbound, streamSettings json_u
 	}
 
 	if inbound.Protocol == model.Shadowsocks {
-		var inboundSettings map[string]any
-		json.Unmarshal([]byte(inbound.Settings), &inboundSettings)
+		inboundSettings := subReq.linkSettings(inbound)
 		method, _ := inboundSettings["method"].(string)
 		serverData[0].Method = method
 
@@ -405,38 +463,44 @@ func (s *SubJsonService) genServer(inbound *model.Inbound, streamSettings json_u
 
 	outbound.Protocol = string(inbound.Protocol)
 	outbound.Tag = "proxy"
-	if s.mux != "" {
-		outbound.Mux = json_util.RawMessage(s.mux)
+	if mux != "" {
+		outbound.Mux = json_util.RawMessage(mux)
 	}
 	outbound.StreamSettings = streamSettings
 
-	settings := map[string]any{
+	// Wrap the endpoint in a "servers" array (the standard Xray schema for
+	// Shadowsocks/Trojan outbounds). The flat top-level form only parses on very
+	// recent xray-core; older bundled cores (e.g. in v2rayN) reject it, so SS
+	// links fail to connect. See genVnext/genVless for the VMess/VLESS shape.
+	server := map[string]any{
 		"address":  serverData[0].Address,
 		"port":     serverData[0].Port,
 		"password": serverData[0].Password,
 		"level":    8,
 	}
 	if inbound.Protocol == model.Shadowsocks {
-		settings["method"] = serverData[0].Method
+		server["method"] = serverData[0].Method
 	}
-	outbound.Settings = settings
+	outbound.Settings = map[string]any{
+		"servers": []any{server},
+	}
 
 	result, _ := json.MarshalIndent(outbound, "", "  ")
 	return result
 }
 
-func (s *SubJsonService) genHy(inbound *model.Inbound, newStream map[string]any, client model.Client) json_util.RawMessage {
+func (s *SubJsonService) genHy(inbound *model.Inbound, newStream map[string]any, client model.Client, mux string) json_util.RawMessage {
 	outbound := Outbound{}
 
 	outbound.Protocol = string(inbound.Protocol)
 	outbound.Tag = "proxy"
 
-	if s.mux != "" {
-		outbound.Mux = json_util.RawMessage(s.mux)
+	if mux != "" {
+		outbound.Mux = json_util.RawMessage(mux)
 	}
 
 	var settings, stream map[string]any
-	json.Unmarshal([]byte(inbound.Settings), &settings)
+	_ = json.Unmarshal([]byte(inbound.Settings), &settings)
 	version, _ := settings["version"].(float64)
 	outbound.Settings = map[string]any{
 		"version": int(version),
@@ -444,8 +508,8 @@ func (s *SubJsonService) genHy(inbound *model.Inbound, newStream map[string]any,
 		"port":    inbound.Port,
 	}
 
-	json.Unmarshal([]byte(inbound.StreamSettings), &stream)
-	hyStream := stream["hysteriaSettings"].(map[string]any)
+	_ = json.Unmarshal([]byte(inbound.StreamSettings), &stream)
+	hyStream, _ := stream["hysteriaSettings"].(map[string]any)
 	outHyStream := map[string]any{
 		"version": int(version),
 		"auth":    client.Auth,
@@ -467,6 +531,55 @@ func (s *SubJsonService) genHy(inbound *model.Inbound, newStream map[string]any,
 
 	outbound.StreamSettings, _ = json.MarshalIndent(newStream, "", "  ")
 
+	result, _ := json.MarshalIndent(outbound, "", "  ")
+	return result
+}
+
+// genWireguard builds an Xray wireguard outbound for a native WireGuard inbound,
+// mirroring genWireguardLink: the peer public key is derived from the inbound
+// secretKey, the client owns the private key / tunnel address / pre-shared key,
+// and the peer routes the full tunnel. Returns nil when the client has no key.
+func (s *SubJsonService) genWireguard(inbound *model.Inbound, client model.Client) json_util.RawMessage {
+	if client.PrivateKey == "" {
+		return nil
+	}
+
+	var inboundSettings map[string]any
+	_ = json.Unmarshal([]byte(inbound.Settings), &inboundSettings)
+	secretKey, _ := inboundSettings["secretKey"].(string)
+
+	peer := map[string]any{
+		"endpoint":   joinHostPort(inbound.Listen, inbound.Port),
+		"allowedIPs": []string{"0.0.0.0/0", "::/0"},
+	}
+	if secretKey != "" {
+		if pub, err := wgutil.PublicKeyFromPrivate(secretKey); err == nil {
+			peer["publicKey"] = pub
+		}
+	}
+	if client.PreSharedKey != "" {
+		peer["preSharedKey"] = client.PreSharedKey
+	}
+	if client.KeepAlive > 0 {
+		peer["keepAlive"] = client.KeepAlive
+	}
+
+	settings := map[string]any{
+		"secretKey": client.PrivateKey,
+		"peers":     []any{peer},
+	}
+	if len(client.AllowedIPs) > 0 {
+		settings["address"] = client.AllowedIPs
+	}
+	if mtu, ok := inboundSettings["mtu"].(float64); ok && mtu > 0 {
+		settings["mtu"] = int(mtu)
+	}
+
+	outbound := map[string]any{
+		"protocol": string(inbound.Protocol),
+		"tag":      "proxy",
+		"settings": settings,
+	}
 	result, _ := json.MarshalIndent(outbound, "", "  ")
 	return result
 }

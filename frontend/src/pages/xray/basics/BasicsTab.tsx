@@ -70,6 +70,28 @@ export default function BasicsTab({
     [mutate],
   );
 
+  const metricsCfg = (templateSettings as { metrics?: { tag?: string; listen?: string } } | null)?.metrics;
+
+  const setMetrics = useCallback(
+    (field: 'tag' | 'listen', value: string) => mutate((tt) => {
+      const node = tt as { metrics?: { tag?: string; listen?: string }; stats?: Record<string, unknown> };
+      const m: { tag?: string; listen?: string } = { ...(node.metrics ?? {}) };
+      if (value.trim() === '') {
+        delete m[field];
+      } else {
+        m[field] = value.trim();
+      }
+      if (!m.listen && !m.tag) {
+        delete node.metrics;
+      } else {
+        node.metrics = m;
+        // xray-core's metrics handler needs a stats object to populate.
+        if (!node.stats) node.stats = {};
+      }
+    }),
+    [mutate],
+  );
+
   function confirmResetDefault() {
     modal.confirm({
       title: t('pages.settings.resetDefaultConfig'),
@@ -93,7 +115,8 @@ export default function BasicsTab({
       ?.sockopt;
     const raw = sockopt?.happyEyeballs;
     if (raw == null || typeof raw !== 'object') return null;
-    return HappyEyeballsSchema.parse(raw);
+    const parsed = HappyEyeballsSchema.safeParse(raw);
+    return parsed.success ? parsed.data : null;
   })();
 
   const setDirectHappyEyeballs = useCallback(
@@ -272,6 +295,29 @@ export default function BasicsTab({
               }
             />
           ))}
+          <SettingListItem
+            title={t('pages.xray.metricsListen')}
+            description={t('pages.xray.metricsListenDesc')}
+            paddings="small"
+            control={
+              <Input
+                value={metricsCfg?.listen ?? ''}
+                onChange={(e) => setMetrics('listen', e.target.value)}
+                placeholder="127.0.0.1:11111"
+              />
+            }
+          />
+          <SettingListItem
+            title={t('pages.xray.metricsTag')}
+            paddings="small"
+            control={
+              <Input
+                value={metricsCfg?.tag ?? ''}
+                onChange={(e) => setMetrics('tag', e.target.value)}
+                placeholder="metrics_out"
+              />
+            }
+          />
         </>
       ),
     },
@@ -296,7 +342,7 @@ export default function BasicsTab({
                 min={0}
                 style={{ width: '100%' }}
                 placeholder="300"
-                addonAfter={t('pages.xray.seconds')}
+                suffix={t('pages.xray.seconds')}
                 onChange={(v) => setLevel0('connIdle', v as number | null)}
               />
             }
@@ -311,7 +357,7 @@ export default function BasicsTab({
                 min={0}
                 style={{ width: '100%' }}
                 placeholder={t('pages.xray.bufferSizePlaceholder')}
-                addonAfter="KB"
+                suffix="KB"
                 onChange={(v) => setLevel0('bufferSize', v as number | null)}
               />
             }

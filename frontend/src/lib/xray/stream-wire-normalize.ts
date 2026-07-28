@@ -16,8 +16,10 @@ const PACKET_UP_FIELDS = [
 const STREAM_UP_SERVER_FIELDS = ['scStreamUpServerSecs'] as const;
 
 const PLACEMENT_STRING_FIELDS = [
-  'sessionPlacement',
-  'sessionKey',
+  'sessionIDPlacement',
+  'sessionIDKey',
+  'sessionIDTable',
+  'sessionIDLength',
   'seqPlacement',
   'seqKey',
   'uplinkDataPlacement',
@@ -44,7 +46,7 @@ function hasMeaningfulHeaders(headers: unknown): boolean {
 // Upper bound of an xray-core Int32Range value: "16-32" -> 32, "4" -> 4,
 // 4 -> 4, "" / null -> 0. xmux fields are ranges, and xray-core keys its
 // mutual-exclusivity check on the `.To` (upper) side.
-function int32RangeUpper(v: unknown): number {
+export function int32RangeUpper(v: unknown): number {
   if (typeof v === 'number') return Number.isFinite(v) ? v : 0;
   if (typeof v !== 'string') return 0;
   const trimmed = v.trim();
@@ -55,13 +57,9 @@ function int32RangeUpper(v: unknown): number {
 }
 
 // xray-core's XmuxConfig rejects a config that sets BOTH maxConnections
-// and maxConcurrency ("maxConnections cannot be specified together with
-// maxConcurrency"). The panel pre-fills maxConcurrency ("16-32") whenever
-// XMUX is enabled, so any explicit maxConnections would otherwise always
-// collide and make xray refuse the config. maxConnections defaults to 0
-// (off), so a positive value is an explicit opt-in to connection-pool
-// mode — honor it and drop the leftover default maxConcurrency, matching
-// core's "one strategy at a time" semantics.
+// and maxConcurrency. A positive maxConnections is an explicit opt-in to
+// connection-pool mode — honor it and drop the leftover maxConcurrency
+// default that load-time hydration backfills onto older saved configs.
 function resolveXmuxExclusivity(xmux: Record<string, unknown>): Record<string, unknown> {
   if (int32RangeUpper(xmux.maxConnections) > 0 && int32RangeUpper(xmux.maxConcurrency) > 0) {
     const out = { ...xmux };
@@ -106,6 +104,18 @@ export function validateRealityTarget(target: string): string | undefined {
   return undefined;
 }
 
+function liftLegacyXhttpSessionKeys(obj: Record<string, unknown>): void {
+  const lift = (legacy: string, renamed: string) => {
+    const v = obj[legacy];
+    if ((obj[renamed] === undefined || obj[renamed] === '') && typeof v === 'string' && v !== '') {
+      obj[renamed] = v;
+    }
+    delete obj[legacy];
+  };
+  lift('sessionPlacement', 'sessionIDPlacement');
+  lift('sessionKey', 'sessionIDKey');
+}
+
 function dropEmptyStrings(obj: Record<string, unknown>, keys: readonly string[]): void {
   for (const key of keys) {
     const v = obj[key];
@@ -129,6 +139,20 @@ function normalizeTlsForWire(raw: Record<string, unknown>): Record<string, unkno
   const out: Record<string, unknown> = { ...raw };
   if (out.fingerprint === '') delete out.fingerprint;
 
+  // Empty server-side tuning fields mean "use xray-core's default" — never emit them.
+  if (Array.isArray(out.curvePreferences) && out.curvePreferences.length === 0) {
+    delete out.curvePreferences;
+  }
+  if (out.masterKeyLog === '' || out.masterKeyLog == null) delete out.masterKeyLog;
+  if (isRecord(out.echSockopt)) {
+    const echSock = normalizeSockoptForWire(out.echSockopt);
+    if (echSock) {
+      out.echSockopt = echSock;
+    } else {
+      delete out.echSockopt;
+    }
+  }
+
   const settings = out.settings;
   if (isRecord(settings)) {
     const settingsOut: Record<string, unknown> = { ...settings };
@@ -144,13 +168,19 @@ export function normalizeXhttpForWire(
   side: StreamWireSide,
 ): Record<string, unknown> {
   const out: Record<string, unknown> = { ...raw };
+  liftLegacyXhttpSessionKeys(out);
   const mode = typeof out.mode === 'string' && out.mode !== '' ? out.mode : 'auto';
   const enableXmux = out.enableXmux === true;
   delete out.enableXmux;
 
   if (side === 'inbound') {
     if (!enableXmux) delete out.xmux;
-    delete out.scMinPostsIntervalMs;
+    // scMinPostsIntervalMs is a client-only tuning knob that subscriptions
+    // must propagate to clients. Only strip the xray-core default ("30")
+    // or empty values — the literal "30" is a known DPI fingerprint (#5141).
+    if (out.scMinPostsIntervalMs === '' || out.scMinPostsIntervalMs === '30') {
+      delete out.scMinPostsIntervalMs;
+    }
     delete out.uplinkChunkSize;
   }
 
@@ -233,7 +263,6 @@ export function normalizeSockoptForWire(
   const he = out.happyEyeballs;
   if (isRecord(he)) {
     const heOut: Record<string, unknown> = { ...he };
-    if (heOut.tryDelayMs === 0) delete heOut.tryDelayMs;
     if (heOut.prioritizeIPv6 === false) delete heOut.prioritizeIPv6;
     if (heOut.interleave === 1) delete heOut.interleave;
     if (heOut.maxConcurrentTry === 4) delete heOut.maxConcurrentTry;

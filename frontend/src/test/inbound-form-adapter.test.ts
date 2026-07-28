@@ -7,6 +7,7 @@ import {
   type RawInboundRow,
 } from '@/lib/xray/inbound-form-adapter';
 import { InboundDbFieldsSchema, InboundFormSchema } from '@/schemas/forms/inbound-form';
+import { normalizeXhttpForWire } from '@/lib/xray/stream-wire-normalize';
 import { SockoptStreamSettingsSchema } from '@/schemas/protocols/stream/sockopt';
 
 // Round-trip: raw DB row → InboundFormValues → wire payload, asserting
@@ -154,6 +155,22 @@ describe('transportless streamSettings (wireguard / tunnel)', () => {
     }
   });
 
+  it('fills sockopt schema defaults for a stored inbound missing tproxy (#5956)', () => {
+    const values = rawInboundToFormValues({
+      port: 443,
+      protocol: 'vless',
+      settings: { clients: [] },
+      streamSettings: JSON.stringify({
+        network: 'tcp',
+        security: 'none',
+        sockopt: { tcpFastOpen: true },
+      }),
+    });
+    const stream = values.streamSettings as { sockopt?: { tproxy?: string; tcpFastOpen?: boolean } };
+    expect(stream.sockopt?.tproxy).toBe('off');
+    expect(stream.sockopt?.tcpFastOpen).toBe(true);
+  });
+
   it('still rejects a present-but-invalid network value', () => {
     const result = InboundFormSchema.safeParse({
       port: 12345,
@@ -289,8 +306,98 @@ describe('subSortIndex', () => {
   });
 
   it('InboundDbFieldsSchema enforces an integer minimum of 1 and defaults to 1', () => {
-    expect(InboundDbFieldsSchema.partial().safeParse({ subSortIndex: 1.5 }).success).toBe(false);
-    expect(InboundDbFieldsSchema.partial().safeParse({ subSortIndex: 0 }).success).toBe(false);
+    // Reject for the RIGHT reason: the issue must be about subSortIndex, not some
+    // unrelated field — otherwise a schema that rejects everything would pass.
+    const nonInt = InboundDbFieldsSchema.partial().safeParse({ subSortIndex: 1.5 });
+    expect(nonInt.success).toBe(false);
+    if (!nonInt.success) expect(nonInt.error.issues[0]?.path).toContain('subSortIndex');
+
+    const belowMin = InboundDbFieldsSchema.partial().safeParse({ subSortIndex: 0 });
+    expect(belowMin.success).toBe(false);
+    if (!belowMin.success) expect(belowMin.error.issues[0]?.path).toContain('subSortIndex');
+
+    // A valid integer >= 1 must pass (guards against a mutant rejecting all values).
+    expect(InboundDbFieldsSchema.partial().safeParse({ subSortIndex: 5 }).success).toBe(true);
     expect(InboundDbFieldsSchema.parse({}).subSortIndex).toBe(1);
+  });
+});
+
+describe('legacy xhttp session keys on edit (#5621)', () => {
+  const legacyXhttpRow: RawInboundRow = {
+    ...vlessRow,
+    streamSettings: {
+      network: 'xhttp',
+      security: 'none',
+      xhttpSettings: {
+        path: '/xh',
+        mode: 'packet-up',
+        sessionPlacement: 'cookie',
+        sessionKey: 'x_session',
+      },
+    },
+  };
+
+  it('rawInboundToFormValues lifts sessionPlacement/sessionKey onto the renamed keys', () => {
+    const values = rawInboundToFormValues(legacyXhttpRow);
+    const xhttp = (values.streamSettings as unknown as Record<string, Record<string, unknown>>).xhttpSettings;
+    expect(xhttp.sessionIDPlacement).toBe('cookie');
+    expect(xhttp.sessionIDKey).toBe('x_session');
+    expect(xhttp.sessionPlacement).toBeUndefined();
+    expect(xhttp.sessionKey).toBeUndefined();
+    expect(xhttp.path).toBe('/xh');
+    expect(xhttp.xPaddingBytes).toBe('100-1000');
+  });
+
+  it('formValuesToWirePayload never emits the legacy key names', () => {
+    const values = rawInboundToFormValues(legacyXhttpRow);
+    const payload = formValuesToWirePayload(values);
+    const stream = JSON.parse(payload.streamSettings) as Record<string, Record<string, unknown>>;
+    expect(stream.xhttpSettings.sessionPlacement).toBeUndefined();
+    expect(stream.xhttpSettings.sessionKey).toBeUndefined();
+    expect(stream.xhttpSettings.sessionIDPlacement).toBe('cookie');
+    expect(stream.xhttpSettings.sessionIDKey).toBe('x_session');
+  });
+
+  it('normalizeXhttpForWire lifts stale legacy keys that bypassed the schema', () => {
+    const out = normalizeXhttpForWire(
+      { sessionPlacement: 'header', sessionKey: 'x_raw' },
+      'inbound',
+    );
+    expect(out.sessionIDPlacement).toBe('header');
+    expect(out.sessionIDKey).toBe('x_raw');
+    expect(out.sessionPlacement).toBeUndefined();
+    expect(out.sessionKey).toBeUndefined();
+  });
+});
+
+describe('xhttp xmux maxConcurrency survives a load/re-save round-trip', () => {
+  const xmuxRow: RawInboundRow = {
+    ...vlessRow,
+    streamSettings: {
+      network: 'xhttp',
+      security: 'none',
+      xhttpSettings: {
+        path: '/xh',
+        mode: 'auto',
+        xmux: { maxConcurrency: '1-2' },
+      },
+    },
+  };
+
+  it('rawInboundToFormValues does not resurrect a non-zero maxConnections', () => {
+    const values = rawInboundToFormValues(xmuxRow);
+    const xhttp = (values.streamSettings as unknown as Record<string, Record<string, unknown>>).xhttpSettings;
+    expect(xhttp.enableXmux).toBe(true);
+    const xmux = xhttp.xmux as Record<string, unknown>;
+    expect(xmux.maxConcurrency).toBe('1-2');
+    expect(xmux.maxConnections).toBe(0);
+  });
+
+  it('formValuesToWirePayload keeps maxConcurrency on an unedited re-save', () => {
+    const values = rawInboundToFormValues(xmuxRow);
+    const payload = formValuesToWirePayload(values);
+    const stream = JSON.parse(payload.streamSettings) as Record<string, Record<string, unknown>>;
+    const xmux = stream.xhttpSettings.xmux as Record<string, unknown>;
+    expect(xmux.maxConcurrency).toBe('1-2');
   });
 });
